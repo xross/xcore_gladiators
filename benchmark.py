@@ -143,8 +143,19 @@ def activated_xtc_environment(base_env: dict, script: Path, needs_xsim: bool = T
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ValueError(f"XTC activation cannot execute {exe}: {exc}") from exc
         if tested.returncode != 0:
+            output = "\n".join(part.strip() for part in (tested.stdout, tested.stderr) if part.strip())
+            # XTC 15.3.1's xsim exits 1 even after successfully printing its
+            # version. Accept only its banner, not arbitrary exit-1 failures
+            # or a banner followed by loader/runtime diagnostics.
+            if (exe == "xsim" and tested.returncode == 1
+                    and re.fullmatch(r"Build [0-9][\w.-]*, [^\r\n]+\r?\n"
+                                     r"Copyright \(C\) XMOS Limited [^\r\n]+", output)):
+                continue
+            diagnostics = "".join(f"\n{label}: {text.strip()[-1200:]}"
+                                  for label, text in (("stdout", tested.stdout), ("stderr", tested.stderr))
+                                  if text.strip())
             raise ValueError(f"XTC activation cannot execute {exe} --version "
-                             f"(exit {tested.returncode}). No model calls were started.")
+                             f"(exit {tested.returncode}). No model calls were started.{diagnostics}")
     return warm
 
 

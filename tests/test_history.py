@@ -96,7 +96,7 @@ class HistoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             script = fake_xtc_install(root)
-            self.assertEqual(script, b.validate_xtc_script(script, matrix))
+            self.assertEqual(script.resolve(), b.validate_xtc_script(script, matrix))
             base_env = dict(os.environ)
             base_env["PATH"] = "/usr/bin:/bin"
             activated = b.activated_xtc_environment(base_env, script, needs_xsim=True)
@@ -106,6 +106,54 @@ class HistoryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "already active"):
                 b.ensure_cold_controls(activated, b.plan(self.conf,
                                                          task_filter="uart-heartbeat-specific"))
+
+    def test_xsim_version_accepts_known_exit_one_banner(self):
+        banner = ("Build 50-9ec4d01, May-01-2025\n"
+                  "Copyright (C) XMOS Limited 2008-2024. All Rights Reserved.")
+        for redirect in ("", " >&2"):
+            with self.subTest(redirect=redirect), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                script = fake_xtc_install(root)
+                (root / "fake-xtc-bin" / "xsim").write_text(
+                    f"#!/bin/sh\necho '{banner}'{redirect}\nexit 1\n", encoding="utf-8")
+                activated = b.activated_xtc_environment(dict(os.environ), script)
+                self.assertEqual(str(root / "fake-xtc-bin"), activated["PATH"].split(":")[0])
+
+    def test_xtc_version_failures_include_output_and_remain_fatal(self):
+        banner = ("Build 50-9ec4d01, May-01-2025\n"
+                  "Copyright (C) XMOS Limited 2008-2024. All Rights Reserved.")
+        cases = [
+            ("xsim", "", "dyld: Library not loaded", 1),
+            ("xsim", "unrecognized option --version", "", 1),
+            ("xsim", banner, "simulator initialization failed", 1),
+            ("xsim", banner, "", 2),
+            ("xcc", banner, "", 1),
+        ]
+        for exe, stdout, stderr, status in cases:
+            with self.subTest(exe=exe, stdout=stdout, stderr=stderr, status=status):
+                with tempfile.TemporaryDirectory() as td:
+                    root = Path(td)
+                    script = fake_xtc_install(root)
+                    (root / "fake-xtc-bin" / exe).write_text(
+                        f"#!/bin/sh\necho '{stdout}'\necho '{stderr}' >&2\nexit {status}\n",
+                        encoding="utf-8")
+                    with self.assertRaises(ValueError) as caught:
+                        b.activated_xtc_environment(dict(os.environ), script)
+                    message = str(caught.exception)
+                    self.assertIn(f"{exe} --version (exit {status})", message)
+                    self.assertIn("No model calls were started", message)
+                    if stdout:
+                        self.assertIn(f"stdout: {stdout}", message)
+                    if stderr:
+                        self.assertIn(f"stderr: {stderr}", message)
+
+    def test_xtc_compiler_only_preflight_does_not_require_xsim(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            script = fake_xtc_install(root)
+            (root / "fake-xtc-bin" / "xsim").unlink()
+            activated = b.activated_xtc_environment(dict(os.environ), script, needs_xsim=False)
+            self.assertEqual(str(root / "fake-xtc-bin"), activated["PATH"].split(":")[0])
 
     def test_smoke_allows_missing_verifier_by_default(self):
         with tempfile.TemporaryDirectory() as td:

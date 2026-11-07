@@ -129,6 +129,9 @@ from the benefit of XMOS-specific instructions.
 ordinary shell with XTC *not* already activated; otherwise the cold controls
 would inherit it and the benchmark refuses to run. The trusted verifier,
 when configured, receives the same XTC environment for every condition.
+XTC 15.3.1's `xsim` returns exit status 1 even when printing its version;
+the preflight accepts that status only with its recognized version banner.
+Other nonzero exits remain fatal and include stdout/stderr in the error.
 
 The three conditions do not form a complete factorial design: testing
 `native` + preactivated XTC later would clarify whether skills still help
