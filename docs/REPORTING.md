@@ -139,16 +139,27 @@ outcomes and publish uncertainty, then collect repeated trials.
 
 ## Repeated experiments and quick pilot
 
-`--smoke` runs two configured worker models (each with/without native skills),
+`--smoke` runs two configured worker models under all three conditions
+(no skills, native skills, and no skills with XTC preactivated),
 then invokes the blind reviewer, even without a verifier. Such trials are
 reported as `unverified`, not passes. When `verify_commands` are configured,
 they run for each candidate and must produce `benchmark-verification.json` with
 an explicit boolean `passed`; missing output is a failed validation.
 Use `--require-verification` for a strict preflight gate.
-Smoke mode uses one repeat and remains exploratory. The four worker runs plus referee incur actual GitHub
+Smoke mode uses one repeat and remains exploratory. The six worker runs plus referee incur actual GitHub
 Copilot usage when running against live models.
 
 Reports live in unique, immutable experiment directories; the SQLite
 `bench-results/gladiators.sqlite3` index permits cross-run trend/comparison
 queries and is rebuildable using `benchmark.py index`. Never compare results
 from different task/prompt revisions as if they were paired trials.
+
+## XTC activation comparison
+
+Include all three conditions (`no_skills`, `native`, `no_skills_xtc`) in the
+scoreboard. Include a separate environment-control table comparing `no_skills`
+with `no_skills_xtc`, and describe which runs were preactivated. This identifies
+whether the first hurdle was toolchain availability rather than code quality.
+Do not report that toolchain setup alone improves correctness unless the
+independent verifier confirms it. The appendix records the activated XTC
+version and fingerprint of the activation script, not local user paths.

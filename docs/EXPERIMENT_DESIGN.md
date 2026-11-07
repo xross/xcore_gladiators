@@ -154,13 +154,48 @@ of software quality that cannot be completely assessed by deterministic tests.
 - H5 (later): MCP-delivered skills can approach native skills in correctness and
   discovery without requiring local skill installation.
 
+## Why we do not want the agent failing at the first hurdle
+
+In an early no-skills run, a model wrote source code but could not build it:
+`xcc` and `xsim` were not available, and CMake could not locate the XMOS
+build-system files because XTC had not been activated. That is useful data
+about onboarding and environment discovery, but it stops the agent before
+we can learn much about the **design quality** of its intended solution.
+
+We therefore measure two different questions rather than conflating them:
+
+1. **Unassisted setup:** With skills absent and XTC not activated, can the
+   agent locate, activate and correctly use an installed toolchain? Do native
+   XMOS skills help it get past this initial obstacle?
+2. **Engineering with tools ready:** With skills still absent but XTC already
+   activated, can the agent build, test and improve a correct implementation?
+   Does the original no-skills failure disappear simply through environment
+   preparation, or do design limitations persist?
+
+This **does not** mean hiding installation issues. Environment setup is a
+real part of customer experience, so cold trials remain important. But
+preactivation gives us a baseline that does not punish a model for an
+avoidable shell setup problem, making the design comparisons more revealing.
+
+The cold conditions and the XTC-preactivated condition have the **same task,
+model, starter project, runtime limit and access to public documentation**.
+The third condition receives *no* skills or supplementary guidance; only
+its exported environment changes. The harness validates that the parent
+shell is cold and checks the warm toolchain before charging for model calls.
+The independent verifier, when enabled, is supplied an equal toolchain
+environment for every condition. Keep this distinction in the report.
+
+The current three conditions are a useful first experiment, not a complete
+2x2 factorial design. Future trials could add `native + XTC` to separate
+skill effects from any interaction with preactivation.
+
 ## Experiment factors
 
 | Factor | Initial settings | Config location |
 |---|---|---|
 | Implementing model | Sol / Opus / small cheap model | `[models.workers]` in `benchmark.toml` |
 | Judge model | Different, high-capability model | `[models].reviewer` |
-| Skill condition | `no_skills`, `native` | `[conditions.*]` |
+| Skill condition | `no_skills`, `native`, `no_skills_xtc` | `[conditions.*]` + `--xtc-env` |
 | Later skill condition | `mcp` | `[conditions.mcp]` (enable when ready) |
 | Problem wording | specific / everyday / vague | Three task entries + prompt files |
 | Trial repetitions | 1 exploratory; 3-5+ for patterns | `[experiment].repeats` |
@@ -176,9 +211,9 @@ workspace and OpenCode session.
 `python3 benchmark.py run --smoke` is a **shortened complete experimental
 pipeline**, not a single-model connectivity check. By default it chooses the
 specified UART/heartbeat task and runs `luna` and `sol` from
-`experiment.smoke_models`, each in both `no_skills` and `native` conditions,
+`experiment.smoke_models`, each in `no_skills`, `native` and `no_skills_xtc` conditions,
 with one repetition. It then invokes the independently configured reviewer
-on the four blinded code candidates and writes `REPORT.rst` and all raw data.
+on the six blinded code candidates and writes `REPORT.rst` and all raw data.
 Smoke mode can run **without a verifier**: every candidate is labelled
 `unverified`, but the separate blind reviewer still scores code quality.
 No correctness pass/fail or verified skills benefit can be concluded from those
@@ -190,7 +225,7 @@ The reviewer scores design, not independently measured correctness. A
 single smoke trial is exploratory and does not establish that skills improve
 correctness or performance. For defensible studies, repeat the full matrix
 several times with a validated verifier.
-This mode makes **five separate Copilot agent invocations** (four workers plus
+This mode makes **seven separate Copilot agent invocations** (six workers plus
 one reviewer) when all are eligible; model pricing and requests must be checked
 before running.
 

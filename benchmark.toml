@@ -5,13 +5,15 @@
 name = "Gladiators - XMOS coding-agent benchmark"
 seed = 20261106
 repeats = 1                 # increase to >= 3 for meaningful comparisons
-smoke_models = ["luna", "sol"]  # --smoke runs these two workers, each native/no_skills, plus referee
+smoke_models = ["luna", "sol"]  # --smoke runs these two workers, each in three conditions, plus referee
 parallel_sim_runs = 1       # 1 preferred for fair wall-time and CPU comparisons
 worker_timeout_seconds = 2700
 reviewer_timeout_seconds = 1200
 verifier_timeout_seconds = 900
 progress_interval_seconds = 20  # console heartbeat during long OpenCode/verifier/review stages; 0 disables
 # Native skill location is REQUIRED on the CLI: --skills-dir /path/to/xskills/skills
+# XTC warm control also requires --xtc-env /path/to/XMOS_XTC_15.3.1/SetEnv.sh
+# (macOS/Linux). Start the script from an ordinary shell with XTC NOT activated.
 # Do not put it in this TOML file.
 # Optional separate HOME with Copilot auth but NO global skills/AGENTS.md.
 # See README instructions before using this on a real machine.
@@ -85,6 +87,11 @@ type = "none"
 [conditions.native]
 type = "native"
 
+# Toolchain preconfigured but NO local/native skills: separates installation
+# obstacles from model design quality. Requires --xtc-env SCRIPT on the CLI.
+[conditions.no_skills_xtc]
+type = "none"
+
 # Enable this later when evaluating the actual XMOS MCP server.
 # [conditions.mcp]
 # type = "mcp"
@@ -119,13 +126,12 @@ cache_write = 12.5
 output = 50.0
 
 # One underlying engineering problem at three levels of user prompt detail.
-# IMPORTANT: --smoke REQUIRES a trusted independent verifier; there is no
-# prepackaged Pyxsim timing test yet. Fill in verify_commands for the selected
-# task BEFORE using --smoke. The commands must create benchmark-verification.json
-# with an explicit boolean passed and may include trusted measured resource data.
+# A verifier is optional, including for --smoke. If no verifier is configured,
+# candidate correctness is explicitly UNVERIFIED. If configured, trusted verifier
+# commands must produce benchmark-verification.json with passed and evidence.
 # See tasks/uart-heartbeat/VERIFIER.md and docs/QUICKSTART.md.
 # Use --task uart-heartbeat-specific for the initial six-run pilot.
-# If --task is omitted, all three prompts run (18 worker trials at repeats=1).
+# If --task is omitted, all three prompts run (27 worker trials at repeats=1).
 # DO NOT apply numerical requirements from the specific variant to a vaguer one.
 
 [[tasks]]

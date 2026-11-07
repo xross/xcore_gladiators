@@ -32,7 +32,7 @@ without it, results are marked `unverified` even though the blind review runs.
 2. Edit `benchmark.toml`. Confirm `[models.workers]` and
    `[models].reviewer`; the reviewer must have a different model ID.
    Check out a pinned `xskills` revision and pass its `skills/` directory
-   on every native-skills plan/run command with `--skills-dir /path/to/xskills/skills`.
+   on every native-skills plan/run command with `--skills-dir /path/to/xskills/skills --xtc-env /Applications/XMOS_XTC_15.3.1/SetEnv.sh`.
    Do **not** put the path in TOML. Invalid paths abort before model calls.
    Set `experiment.clean_home` when you have a dedicated isolated OpenCode
    profile. Verify its Copilot login separately. Do not copy credentials into
@@ -50,14 +50,14 @@ without it, results are marked `unverified` even though the blind review runs.
 5. Plan and test the harness without spending Copilot credits:
 
    ```sh
-   python3 benchmark.py plan --task uart-heartbeat-specific --skills-dir /path/to/xskills/skills
+   python3 benchmark.py plan --task uart-heartbeat-specific --skills-dir /path/to/xskills/skills --xtc-env /Applications/XMOS_XTC_15.3.1/SetEnv.sh
    python3 -m unittest discover -s tests -v
    ```
 
    Then run just the six specific-prompt trials:
 
    ```sh
-   python3 benchmark.py run --task uart-heartbeat-specific --skills-dir /path/to/xskills/skills
+   python3 benchmark.py run --task uart-heartbeat-specific --skills-dir /path/to/xskills/skills --xtc-env /Applications/XMOS_XTC_15.3.1/SetEnv.sh
    ```
 
    The runner prints `[current/total | % complete]` when each worker starts
@@ -72,15 +72,15 @@ without it, results are marked `unverified` even though the blind review runs.
    For a smaller end-to-end trial **including a separate blind reviewer**:
 
    ```sh
-   python3 benchmark.py plan --smoke --skills-dir /path/to/xskills/skills
-   python3 benchmark.py run --smoke --skills-dir /path/to/xskills/skills --progress-every 5
+   python3 benchmark.py plan --smoke --skills-dir /path/to/xskills/skills --xtc-env /Applications/XMOS_XTC_15.3.1/SetEnv.sh
+   python3 benchmark.py run --smoke --skills-dir /path/to/xskills/skills --xtc-env /Applications/XMOS_XTC_15.3.1/SetEnv.sh --progress-every 5
    ```
 
    Smoke mode picks one prompt, two worker models (`experiment.smoke_models`
-   in `benchmark.toml`, default `luna` and `sol`), and runs each model with
-   and without native skills (4 worker sessions). The independent high-quality
-   referee then reviews all four anonymised solutions. Model/provider calls
-   **can incur real GitHub Copilot costs**. With no verifier, all four
+   in `benchmark.toml`, default `luna` and `sol`), and runs each model under all three conditions (no skills, native skills,
+   and no skills with XTC preactivated): six worker sessions. The independent
+   high-quality referee then reviews all six anonymised solutions. Model/provider calls
+   **can incur real GitHub Copilot costs**. With no verifier, all six
    correctness outcomes are **unverified**, but the blind review still runs.
    When configured, the verifier checks each candidate. Use
    `--require-verification` to fail before paid calls when no verifier exists.
@@ -110,8 +110,8 @@ linked-library lists, memory figures, or evidence of correctness.
 ## Run all wording variants / add more problems
 
 ```sh
-python3 benchmark.py plan --skills-dir /path/to/xskills/skills
-python3 benchmark.py run --skills-dir /path/to/xskills/skills
+python3 benchmark.py plan --skills-dir /path/to/xskills/skills --xtc-env /Applications/XMOS_XTC_15.3.1/SetEnv.sh
+python3 benchmark.py run --skills-dir /path/to/xskills/skills --xtc-env /Applications/XMOS_XTC_15.3.1/SetEnv.sh
 ```
 
 The three prompt variants are separate test IDs, so the full initial matrix
@@ -174,3 +174,16 @@ python3 benchmark.py report --results bench-results/<run-id>
 
 Use [REPORTING.md](REPORTING.md) to interpret the model profiles and the
 frozen reporting configuration recorded in `experiment.json`.
+
+## XTC environment control
+
+Run from a shell where XTC is not already activated. `--xtc-env` must point
+to the *sourcable* activation script (macOS `SetEnv.sh`, Linux `SetEnv`).
+Only `no_skills_xtc` workers inherit the activated environment. The other
+workers can activate XTC themselves using their own knowledge or skills.
+This avoids conflating an environment setup failure with an inability to
+implement a correct design. See `docs/EXPERIMENT_DESIGN.md` for the rationale.
+
+The warm trial preflight checks `xcc` (and `xsim` for simulation tasks) before
+starting paid Copilot calls. A trusted verifier, if configured, has the same
+XTC environment regardless of worker condition.

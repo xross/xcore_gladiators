@@ -77,12 +77,13 @@ Each task is repeated for every configured worker and condition:
 
 | Condition | What the worker receives |
 |---|---|
-| `no_skills` | Unmodified starter project; OpenCode native skill tool denied |
-| `native` | Same starter plus a checked-out, pinned `xskills/skills` catalogue copied to `.opencode/skills` |
-| `mcp` (later) | Same starter with an XMOS MCP server configured; native skill tool denied |
+| `no_skills` | Unmodified starter; native skills disabled, XTC installed but not activated by Gladiators |
+| `native` | Same starter plus pinned `xskills/skills`; XTC not preactivated, so the agent must discover setup guidance |
+| `no_skills_xtc` | No skills, but XTC activated in OpenCode's inherited environment before the worker starts |
+| `mcp` (later) | Same starter with an XMOS MCP server; native skill tool denied |
 
-For one selected prompt, `repeats = 1` means **6 worker runs** and one blind
-reviewer. With all three prompt variants enabled, that is **18 worker runs**
+For one selected prompt, `repeats = 1` means **9 worker runs** and one blind
+reviewer. With all three prompt variants enabled, that is **27 worker runs**
 and three independent blind reviews. Use `--task uart-heartbeat-specific`
 for the initial six-run pilot to control cost. Increase to **3-5 repeats** before drawing strong statistical
 conclusions; AI responses vary from run to run. Keep prompts, toolchains,
@@ -103,6 +104,36 @@ and workspace. Only once all candidate runs have finished does the reviewer
 receive source snapshots named `candidate_01`, `candidate_02`, etc. It does not
 see the model, skill condition, execution time or cost when scoring designs.
 The final report maps anonymous evaluations back to models and conditions.
+
+### Why test a preactivated XTC environment?
+
+A recent unskilled agent generated source but could not compile it because
+`xcc`, `xsim` and the CMake toolchain environment were absent from its shell.
+It then stopped at the **first hurdle**, before its architecture and timing
+choices could be assessed. For a benchmark of AI *engineering ability* this is
+an important confounder: a failure to locate the toolchain is not necessarily
+a failure to solve the specified software problem.
+
+Gladiators therefore includes `no_skills_xtc` as a controlled third condition.
+In the original `no_skills` and `native` conditions, XTC remains installed but
+is **not** activated by the harness; the worker can discover and activate it
+itself. In `no_skills_xtc`, the harness sources the specified XTC SetEnv script
+**before** launching OpenCode, and the model receives no extra instructions
+or native skills. This isolates the practical benefit of preconfigured tools
+from the benefit of XMOS-specific instructions.
+
+`--xtc-env SCRIPT` is required when `no_skills_xtc` is selected. Use
+`SetEnv.sh` on macOS or `SetEnv` on Linux; do not use interactive
+`SetEnv.command`. It verifies `xcc --version` and, for simulator tasks,
+`xsim --version` **before any Copilot request**. Launch Gladiators from an
+ordinary shell with XTC *not* already activated; otherwise the cold controls
+would inherit it and the benchmark refuses to run. The trusted verifier,
+when configured, receives the same XTC environment for every condition.
+
+The three conditions do not form a complete factorial design: testing
+`native` + preactivated XTC later would clarify whether skills still help
+when initial environment friction is removed. Without an independent verifier,
+we can compare time/cost and code decisions but **not claim correctness**.
 
 ### Live progress while a contest runs
 
@@ -220,29 +251,29 @@ Copilot authentication.
 5. Check the plan and then run the benchmark:
 
 ```sh
-python3 benchmark.py plan --task uart-heartbeat-specific --skills-dir /path/to/xskills/skills
+python3 benchmark.py plan --task uart-heartbeat-specific --skills-dir /path/to/xskills/skills --xtc-env /Applications/XMOS_XTC_15.3.1/SetEnv.sh
 python3 -m unittest discover -s tests -v
-python3 benchmark.py run --task uart-heartbeat-specific --skills-dir /path/to/xskills/skills
+python3 benchmark.py run --task uart-heartbeat-specific --skills-dir /path/to/xskills/skills --xtc-env /Applications/XMOS_XTC_15.3.1/SetEnv.sh
 ```
 
 To see more frequent progress updates during the first live pilot:
 
 ```sh
-python3 benchmark.py run --task uart-heartbeat-specific --skills-dir /path/to/xskills/skills --progress-every 5
+python3 benchmark.py run --task uart-heartbeat-specific --skills-dir /path/to/xskills/skills --xtc-env /Applications/XMOS_XTC_15.3.1/SetEnv.sh --progress-every 5
 ```
 
 For a **short but complete pilot**, use `--smoke`. It tests one problem
-with two models (`experiment.smoke_models`, default Luna and Sol), **both with
-and without native skills** (4 worker runs), then runs the **separate blind
+with two models (`experiment.smoke_models`, default Luna and Sol), **three conditions**
+(no skills, native skills, no skills + preactivated XTC; 6 worker runs), then runs the **separate blind
 reviewer** (one additional Copilot model call). This lets you verify the full
 collection-and-reporting pipeline without the full model/task matrix:
 
 ```sh
-python3 benchmark.py plan --smoke --skills-dir /path/to/xskills/skills
-python3 benchmark.py run --smoke --skills-dir /path/to/xskills/skills --progress-every 5
+python3 benchmark.py plan --smoke --skills-dir /path/to/xskills/skills --xtc-env /Applications/XMOS_XTC_15.3.1/SetEnv.sh
+python3 benchmark.py run --smoke --skills-dir /path/to/xskills/skills --xtc-env /Applications/XMOS_XTC_15.3.1/SetEnv.sh --progress-every 5
 ```
 
-Smoke mode **does not require a verifier**. If none is configured, the four
+Smoke mode **does not require a verifier**. If none is configured, the six
 implementations are marked `unverified` and the separate blind reviewer still
 assesses the code. The report does not turn those judgements into verified
 correctness or valid skills-effectiveness pass/fail conclusions. If a trusted

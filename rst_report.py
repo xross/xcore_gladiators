@@ -204,6 +204,39 @@ def build_report(root: Path, conf: dict, manifest: dict | None, results: list[di
     r.para("Deltas are native minus no-skills (negative is quicker/cheaper). "
            "Time deltas are reported only where both implementations independently passed.")
 
+    if "no_skills_xtc" in conf["conditions"]:
+        r.section("XTC environment control - avoiding the first hurdle")
+        r.para("This control tests whether an agent's apparent lack of progress comes from "
+               "finding and activating XTC rather than solving the engineering problem. "
+               "Neither control receives XMOS skills; only no_skills_xtc starts "
+               "with XTC preactivated. All results remain unverified unless an "
+               "independent verifier passes.")
+        env_rows = []
+        for (task, model, trial), pair in sorted(pairs.items()):
+            no = pair.get("no_skills")
+            warm = pair.get("no_skills_xtc")
+            if no is None and warm is None:
+                continue
+            def duration(entry):
+                return entry.get("invocation", {}).get("elapsed_seconds") if entry else None
+            def price(entry):
+                return entry.get("usage", {}).get("copilot_estimated_usd") if entry else None
+            elapsed_delta = None
+            cost_delta = None
+            if (no and warm and
+                not no.get("error") and not warm.get("error")):
+                if isinstance(duration(no), (float, int)) and isinstance(duration(warm), (float, int)):
+                    elapsed_delta = round(duration(warm) - duration(no), 2)
+                if isinstance(price(no), (float, int)) and isinstance(price(warm), (float, int)):
+                    cost_delta = round(price(warm) - price(no), 5)
+            env_rows.append([task, model, trial, _condition_status(no), _condition_status(warm),
+                             elapsed_delta, cost_delta])
+        r.table(["Task", "Model", "Trial", "No skills", "No skills + XTC",
+                 "Elapsed delta (s)", "Cost delta (USD)"], env_rows)
+        r.para("Deltas are preactivated XTC minus ordinary no-skills (negative is "
+               "faster/cheaper). They compare completed runs; they do NOT establish "
+               "correctness or skill effectiveness without independent verification.")
+
     r.section("Referee's verdict")
     if not reviews:
         r.para("No blind review was run.")
@@ -227,6 +260,8 @@ def build_report(root: Path, conf: dict, manifest: dict | None, results: list[di
            "Models were accessed **through GitHub Copilot**; worker variants were "
            f"{cell(conditions)}. A separate model reviewed anonymised implementations "
            "after the worker runs and independent build/simulation/hardware verification. "
+           "The preactivated-XTC control (when selected) has no skills; only its "
+           "toolchain environment differs from the no-skills baseline. "
            "Time, token use, skills invoked and estimated Copilot costs were recorded. "
            "Single trials should not be treated as statistically significant.")
     role_rows = []
@@ -335,7 +370,8 @@ def build_report(root: Path, conf: dict, manifest: dict | None, results: list[di
         "source snapshots live under ``runs/``. "
         f"Configuration SHA-256: {cell(manifest.get('configuration_sha256', 'unrecorded') if manifest else 'unrecorded')}.",
         f"OpenCode: {cell(environment.get('opencode_version') or 'not verified')}; "
-        f"XTC: {cell(environment.get('compiler_version') or 'not verified')}; "
+        f"XTC in original shell: {cell(environment.get('compiler_version') or 'not activated')}; "
+        f"XTC in warm control: {cell(environment.get('xtc_preactivated_version') or 'not configured')}; "
         f"xskills commit: {cell(environment.get('xskills_revision') or 'unrecorded')}.",
         "Run directories are separated, but filesystem isolation is not enforced by the OS. "
         "Use containers/VMs for a rigorous isolation boundary.",

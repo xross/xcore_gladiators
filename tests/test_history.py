@@ -16,25 +16,40 @@ import benchmark as b
 import results_store as store
 
 
+def fake_xtc_install(root: Path) -> Path:
+    """A fake local XTC activation script for tests; no real compiler needed."""
+    tools = root / "fake-xtc-bin"
+    tools.mkdir(parents=True, exist_ok=True)
+    for name in ("xcc", "xsim"):
+        prog = tools / name
+        prog.write_text("#!/bin/sh\necho 'fake XTC version 15.3.1'\n", encoding="utf-8")
+        prog.chmod(0o755)
+    script = root / "SetEnv.sh"
+    script.write_text(f'export PATH="{tools}:$PATH"\n', encoding="utf-8")
+    return script
+
+
 class HistoryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.cfg = Path(b.__file__).parent / "benchmark.toml"
         cls.conf = b.load_config(cls.cfg)
 
-    def test_smoke_selects_two_models_both_conditions_with_referee(self):
+    def test_smoke_selects_two_models_three_conditions_with_referee(self):
         matrix = b.plan(self.conf, smoke=True)
-        self.assertEqual(4, len(matrix))
+        self.assertEqual(6, len(matrix))
         self.assertEqual({"uart-heartbeat-specific"}, {m[0]["id"] for m in matrix})
         self.assertEqual({"luna", "sol"}, {m[1] for m in matrix})
         self.assertEqual({("luna", "native"), ("luna", "no_skills"),
-                          ("sol", "native"), ("sol", "no_skills")}, {(m[1],m[3]) for m in matrix})
+                          ("luna", "no_skills_xtc"), ("sol", "native"),
+                          ("sol", "no_skills"), ("sol", "no_skills_xtc")},
+                         {(m[1],m[3]) for m in matrix})
         self.assertEqual({1}, {m[4] for m in matrix})
         selected = b.config_for_selected_matrix(self.conf, matrix, True)
         self.assertEqual(["sol", "luna"], list(selected["models"]["workers"]))
         self.assertTrue(selected["experiment"]["review_enabled"])
         self.assertEqual(1, selected["experiment"]["repeats"])
-        self.assertEqual(2, len(selected["conditions"]))
+        self.assertEqual(3, len(selected["conditions"]))
         with self.assertRaisesRegex(ValueError, "two models"):
             b.plan(self.conf, model_filter="sol", smoke=True)
         with self.assertRaisesRegex(ValueError, "two distinct"):
@@ -73,6 +88,25 @@ class HistoryTests(unittest.TestCase):
                     b.main()
             self.assertFalse(results.exists())
 
+    def test_warm_control_requires_script_and_actually_activates_xtc(self):
+        matrix = b.plan(self.conf, task_filter="uart-heartbeat-specific", model_filter="luna",
+                        condition_filter="no_skills_xtc", repeats=1)
+        with self.assertRaisesRegex(ValueError, "require --xtc-env"):
+            b.validate_xtc_script(None, matrix)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            script = fake_xtc_install(root)
+            self.assertEqual(script, b.validate_xtc_script(script, matrix))
+            base_env = dict(os.environ)
+            base_env["PATH"] = "/usr/bin:/bin"
+            activated = b.activated_xtc_environment(base_env, script, needs_xsim=True)
+            self.assertEqual(str(root / "fake-xtc-bin"), activated["PATH"].split(":")[0])
+            self.assertIn("fake-xtc-bin", activated["PATH"])
+            b.ensure_cold_controls(base_env, b.plan(self.conf, task_filter="uart-heartbeat-specific"))
+            with self.assertRaisesRegex(ValueError, "already active"):
+                b.ensure_cold_controls(activated, b.plan(self.conf,
+                                                         task_filter="uart-heartbeat-specific"))
+
     def test_smoke_allows_missing_verifier_by_default(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -85,7 +119,7 @@ class HistoryTests(unittest.TestCase):
             results = root / "results"
             with patch.object(b, "load_config", return_value=conf), patch.object(sys, "argv", [
                 "benchmark.py", "run", "--smoke", "--skills-dir", str(root / "skills"),
-                "--results-root", str(results)]):
+                "--xtc-env", str(fake_xtc_install(root)), "--results-root", str(results)]):
                 # It reaches the OpenCode availability preflight, proving no verifier is required.
                 with self.assertRaisesRegex(ValueError, "OpenCode executable not found"):
                     b.main()
@@ -102,7 +136,8 @@ class HistoryTests(unittest.TestCase):
             results = root / "results"
             with patch.object(b, "load_config", return_value=conf), patch.object(sys, "argv", [
                 "benchmark.py", "run", "--smoke", "--require-verification",
-                "--skills-dir", str(root / "skills"), "--results-root", str(results)]):
+                "--skills-dir", str(root / "skills"), "--xtc-env", str(fake_xtc_install(root)),
+                "--results-root", str(results)]):
                 with self.assertRaisesRegex(ValueError, "Independent verification required"):
                     b.main()
             self.assertFalse(results.exists())
@@ -230,11 +265,12 @@ class HistoryTests(unittest.TestCase):
             results = root / "results"
             with patch.object(b, "load_config", return_value=conf), patch.object(sys, "argv", [
                 "benchmark.py", "run", "--smoke", "--progress-every", "0",
-                "--results-root", str(results), "--skills-dir", str(root / "skills")]):
+                "--results-root", str(results), "--skills-dir", str(root / "skills"),
+                "--xtc-env", str(fake_xtc_install(root))]):
                 self.assertEqual(0, b.main())
             db = store.connect(results / "gladiators.sqlite3")
             try:
-                self.assertEqual(4, db.execute("SELECT COUNT(*) FROM trials").fetchone()[0])
+                self.assertEqual(6, db.execute("SELECT COUNT(*) FROM trials").fetchone()[0])
                 self.assertEqual({"unverified"}, {r[0] for r in db.execute("SELECT verification_status FROM trials")})
                 self.assertEqual({"reviewed"}, {r[0] for r in db.execute("SELECT status FROM reviews")})
             finally:
@@ -260,12 +296,13 @@ class HistoryTests(unittest.TestCase):
             results = base / "results"
             with patch.object(b, "load_config", return_value=conf), patch.object(sys, "argv", [
                 "benchmark.py", "run", "--smoke", "--progress-every", "0",
-                "--results-root", str(results), "--skills-dir", str(base / "skills")]):
+                "--results-root", str(results), "--skills-dir", str(base / "skills"),
+                "--xtc-env", str(fake_xtc_install(base))]):
                 self.assertEqual(0, b.main())
             db = store.connect(results / "gladiators.sqlite3")
             try:
                 self.assertEqual(1, db.execute("SELECT COUNT(*) FROM experiments").fetchone()[0])
-                self.assertEqual(4, db.execute("SELECT COUNT(*) FROM trials").fetchone()[0])
+                self.assertEqual(6, db.execute("SELECT COUNT(*) FROM trials").fetchone()[0])
                 self.assertEqual(1, db.execute("SELECT COUNT(*) FROM reviews").fetchone()[0])
                 self.assertEqual({"reviewed"}, {r[0] for r in db.execute("SELECT status FROM reviews")})
                 self.assertEqual({"passed"}, {r[0] for r in db.execute("SELECT verification_status FROM trials")})

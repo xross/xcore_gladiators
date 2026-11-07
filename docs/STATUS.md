@@ -75,3 +75,12 @@ archived and return a nonzero exit status rather than claiming an evaluation.
   conclusions. Method at a glance follows; detailed metrics and model profiles
   are in an appendix. Model size is not shown.
 - Native skills paths are supplied only with the required `--skills-dir` flag.
+
+## Three-condition toolchain control
+
+The initial pilot now includes native skills, no skills (cold XTC), and no
+skills with XTC preactivated. The warm trial requires `--xtc-env` on the CLI;
+no XTC path is stored in TOML. Smoke mode runs two models through all three
+conditions and the separate blind referee. A verifier remains optional.
+The experimental purpose is to distinguish an avoidable toolchain setup
+obstacle from the quality of the generated solution.

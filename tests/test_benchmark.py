@@ -18,7 +18,7 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_matrix_and_distinct_reviewer(self):
         matrix = b.plan(self.conf)
-        self.assertEqual(18, len(matrix))
+        self.assertEqual(27, len(matrix))
         self.assertEqual(3, len(self.conf["tasks"]))
         self.assertEqual({"specific", "everyday", "vague"},
                          {t["specificity"] for t in self.conf["tasks"]})
@@ -43,11 +43,25 @@ class BenchmarkTests(unittest.TestCase):
         self.assertNotIn("115200", prompts["vague"])
         self.assertLess(len(prompts["vague"]), len(prompts["specific"]))
 
-    def test_each_variant_has_six_worker_conditions(self):
+    def test_each_variant_has_nine_worker_conditions(self):
         from collections import Counter
         matrix = b.plan(self.conf)
-        self.assertEqual({t["id"]: 6 for t in self.conf["tasks"]},
+        self.assertEqual({t["id"]: 9 for t in self.conf["tasks"]},
                          dict(Counter(t["id"] for t, *_ in matrix)))
+
+    def test_warm_control_has_no_skills_but_uses_separate_environment(self):
+        matrix = b.plan(self.conf, task_filter="uart-heartbeat-specific")
+        self.assertEqual({"no_skills", "native", "no_skills_xtc"}, {m[3] for m in matrix})
+        with tempfile.TemporaryDirectory() as td:
+            workspace = Path(td) / "worker"
+            config, _ = b.prepare_project(workspace, self.conf["tasks"][0], self.config_path,
+                                           "no_skills_xtc", self.conf)
+            settings = json.loads(config.read_text(encoding="utf-8"))
+            self.assertIn({"action": "skill", "resource": "*", "effect": "deny"},
+                          settings["permissions"])
+            self.assertFalse((workspace / ".opencode" / "skills").exists())
+            self.assertIn("NO-SKILLS control", b.worker_prompt(self.conf["tasks"][0],
+                                                               self.config_path, "no_skills_xtc"))
 
     def test_pricing_caches_not_double_counts_reasoning(self):
         export = {"session": {"tokens": {"input": 1_000_000, "output": 100_000,

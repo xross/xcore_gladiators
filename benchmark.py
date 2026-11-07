@@ -95,6 +95,69 @@ def validate_skills_directory(value: Path | None, matrix: list[tuple]) -> Path |
     return path
 
 
+def validate_xtc_script(value: Path | None, matrix: list[tuple]) -> Path | None:
+    """Require a toolchain activation script for the preconfigured-XTC control."""
+    required = any(row[3] == "no_skills_xtc" for row in matrix)
+    if not required:
+        return None
+    if value is None:
+        raise ValueError("no_skills_xtc trials require --xtc-env /path/to/SetEnv.sh "
+                         "(XTC activation script). No model calls were started.")
+    path = value.expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"XTC activation script does not exist: {path}. No model calls were started.")
+    return path
+
+
+def activated_xtc_environment(base_env: dict, script: Path, needs_xsim: bool = True) -> dict:
+    """Source XTC in bash once and capture its *exported* environment for OpenCode.
+
+    On macOS this accepts /Applications/XMOS_XTC_VERSION/SetEnv.sh; on Linux,
+    the installation's SetEnv script. Do NOT launch SetEnv.command (interactive).
+    """
+    if os.name == "nt":
+        raise ValueError("--xtc-env currently supports macOS/Linux shell scripts; "
+                         "Windows SetEnv.bat activation is not yet implemented")
+    source = 'source "$1" >/dev/null && "$2" -c "import os,json; print(json.dumps(dict(os.environ)))"'
+    try:
+        proc = subprocess.run(["bash", "-c", source, "gladiators-xtc", str(script), sys.executable],
+                              env=base_env, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"Unable to activate XTC using {script.name}: {exc}") from exc
+    if proc.returncode:
+        raise ValueError(f"XTC activation failed ({script.name}): "
+                         f"{proc.stderr[-1200:] or f'exit {proc.returncode}'}. No model calls were started.")
+    try:
+        warm = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"XTC activation script did not produce a usable environment: {exc}") from exc
+    expected = ["xcc"] + (["xsim"] if needs_xsim else [])
+    for exe in expected:
+        path = shutil.which(exe, path=warm.get("PATH", ""))
+        if not path:
+            raise ValueError(f"XTC activation ({script.name}) did not put {exe} on PATH. "
+                             "No model calls were started.")
+        try:
+            tested = subprocess.run([path, "--version"], env=warm, capture_output=True,
+                                    text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ValueError(f"XTC activation cannot execute {exe}: {exc}") from exc
+        if tested.returncode != 0:
+            raise ValueError(f"XTC activation cannot execute {exe} --version "
+                             f"(exit {tested.returncode}). No model calls were started.")
+    return warm
+
+
+def ensure_cold_controls(base_env: dict, matrix: list[tuple]) -> None:
+    """Prevent preactivated XTC being silently inherited by supposedly cold conditions."""
+    if any(row[3] in ("no_skills", "native") for row in matrix):
+        if shutil.which("xcc", path=base_env.get("PATH", "")):
+            raise ValueError("XTC is already active in Gladiators' parent shell; "
+                             "cold skills/no-skills conditions would inherit it. "
+                             "Start Gladiators from a shell without XTC activated, then "
+                             "use --xtc-env SCRIPT for the warm condition. No model calls were started.")
+
+
 def preflight_inputs(matrix: list[tuple], config_path: Path) -> None:
     """Catch missing task inputs before starting any expensive model calls."""
     for task in {row[0]["id"]: row[0] for row in matrix}.values():
@@ -227,7 +290,7 @@ def prepare_project(workspace: Path, task: dict, config_path: Path, condition: s
         for skill in sorted(src.iterdir()):
             if skill.is_dir() and (skill / "SKILL.md").is_file() and not skill.is_symlink():
                 shutil.copytree(skill, skills_dest / skill.name, symlinks=False)
-    elif condition != "no_skills" and conf["conditions"][condition]["type"] != "mcp":
+    elif condition not in ("no_skills", "no_skills_xtc") and conf["conditions"][condition]["type"] != "mcp":
         raise ValueError(f"Unsupported condition {condition}")
 
     # OpenCode V2 permissions; explicit denials are still enforced with --auto.
@@ -269,8 +332,8 @@ def worker_prompt(task: dict, config_path: Path, condition: str) -> str:
         "Write DESIGN.md with design decisions, threads per tile, libraries, RAM/flash if measured,\n"
         "time/timing tradeoffs, and verification evidence. Mark unmeasured values as unknown.\n"
     )
-    if condition == "no_skills":
-        context += "This is the NO-SKILLS control: do not load any skill or skill catalogue.\n"
+    if condition in ("no_skills", "no_skills_xtc"):
+        context += "This is a NO-SKILLS control: do not load any skill or skill catalogue.\n"
     elif condition == "native":
         context += "Native XMOS agent skills are installed in this project. Consult relevant native skills.\n"
     else:
@@ -616,11 +679,16 @@ def run_one(conf: dict, config_path: Path, result_root: Path, task: dict, model_
             model: str, condition: str, repeat: int, skills_dir: Path | None = None,
             progress: Callable[[str], None] | None = None,
             progress_interval: float = 20.0,
-            require_verifier_output: bool = False) -> dict:
+            require_verifier_output: bool = False,
+            xtc_env: dict | None = None) -> dict:
     run_id = f"{task['id']}--{model_label}--{condition}--r{repeat}"
     run_dir = result_root / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     env = config_environment(conf, config_path)
+    if condition == "no_skills_xtc":
+        if xtc_env is None:
+            raise ValueError("No-skills+XTC trial requires a successfully preactivated XTC environment")
+        env = dict(xtc_env)
     exp = conf["experiment"]
     opencode = exp.get("opencode_command", "opencode")
     stamp = now_iso()
@@ -674,7 +742,7 @@ def run_one(conf: dict, config_path: Path, result_root: Path, task: dict, model_
                 warnings.append(f"MODEL MISMATCH: requested {model}, observed {observed}; exclude this run from valid comparison")
             elif not observed:
                 warnings.append("Actual served model ID not independently verifiable from exported transcript")
-            if condition == "no_skills" and skills:
+            if condition in ("no_skills", "no_skills_xtc") and skills:
                 warnings.append("Skill-related tool calls observed in NO-SKILLS control; inspect for contamination")
             execution_error = None
             if invocation["timed_out"]:
@@ -693,7 +761,10 @@ def run_one(conf: dict, config_path: Path, result_root: Path, task: dict, model_
                 if progress:
                     progress("  [verify] checking independent correctness" if task.get("verify_commands")
                              else "  [verify] no trusted verifier configured; will mark UNVERIFIED")
-                verifier = verify_candidate(task, workspace, env, run_dir,
+                # The trusted verifier receives the same available XTC environment
+                # for EVERY condition. Only the worker's environment differs.
+                verifier_env = xtc_env if xtc_env is not None else config_environment(conf, config_path)
+                verifier = verify_candidate(task, workspace, verifier_env, run_dir,
                                             int(exp.get("verifier_timeout_seconds", 900)),
                                             progress=progress, progress_interval=progress_interval,
                                             require_verifier_output=require_verifier_output)
@@ -708,6 +779,7 @@ def run_one(conf: dict, config_path: Path, result_root: Path, task: dict, model_
             snapshot = snapshot_project(workspace, run_dir / "source")
             result = {"run_id": run_id, "task_id": task["id"], "kind": task["kind"],
                       "model_label": model_label, "model": model, "condition": condition,
+                      "xtc_preconfigured": condition == "no_skills_xtc",
                       "task_family": task.get("family", task["id"]),
                       "prompt_specificity": task.get("specificity", "unspecified"),
                       "prompt_sha256": hashlib.sha256(relpath(task["prompt"], config_path).read_bytes()).hexdigest(),
@@ -732,6 +804,7 @@ def run_one(conf: dict, config_path: Path, result_root: Path, task: dict, model_
                          f"(details in {run_dir / 'harness-error.log'})")
             result = {"run_id": run_id, "task_id": task["id"], "model_label": model_label,
                       "model": model, "condition": condition, "repeat": repeat,
+                      "xtc_preconfigured": condition == "no_skills_xtc",
                       "task_family": task.get("family", task["id"]),
                       "prompt_specificity": task.get("specificity", "unspecified"),
                       "started_utc": stamp, "error": f"{type(exc).__name__}: {exc}",
@@ -885,10 +958,10 @@ def report_config_snapshot(conf: dict, selected_task_ids: set[str]) -> dict:
     }
 
 
-def probe_cli_version(argv: list[str]) -> str | None:
+def probe_cli_version(argv: list[str], env: dict | None = None) -> str | None:
     """Best-effort informational check; failure never breaks a benchmark run."""
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=8)
+        done = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=8)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if done.returncode != 0:
@@ -897,7 +970,8 @@ def probe_cli_version(argv: list[str]) -> str | None:
     return version_lines[0][:180] if version_lines else None
 
 
-def study_environment(conf: dict, config_path: Path, skills_dir: Path | None = None) -> dict:
+def study_environment(conf: dict, config_path: Path, skills_dir: Path | None = None,
+                      xtc_script: Path | None = None, xtc_env: dict | None = None) -> dict:
     skills_revision = (probe_cli_version(["git", "-C", str(skills_dir),
                                           "rev-parse", "HEAD"]) if skills_dir else None)
     # Hash content, not the install location. This allows comparisons across
@@ -917,6 +991,11 @@ def study_environment(conf: dict, config_path: Path, skills_dir: Path | None = N
         "platform": sys.platform,
         "opencode_version": probe_cli_version([conf["experiment"].get("opencode_command", "opencode"), "--version"]),
         "compiler_version": probe_cli_version(["xcc", "--version"]),
+        "xtc_preactivated_version": (
+            probe_cli_version([shutil.which("xcc", path=xtc_env["PATH"]), "--version"], env=xtc_env)
+            if xtc_env is not None else None),
+        "xtc_activation_script_sha256": (
+            hashlib.sha256(xtc_script.read_bytes()).hexdigest() if xtc_script else None),
         "xskills_revision": skills_revision,
         "skills_sha256": skill_fingerprint,
         "skills_count": skill_count,
@@ -962,8 +1041,8 @@ def plan(conf: dict, task_filter: str | None = None, model_filter: str | None = 
 
     --smoke chooses one task (preferring a specific prompt), exactly two
     configured worker models (experiment.smoke_models, or the two lowest-cost
-    by recorded token-price assumptions), and both no_skills/native conditions,
-    with one repeat and independent blind review.
+    by recorded token-price assumptions), and all three conditions
+    (no_skills, native, no_skills_xtc), with one repeat and blind review.
     """
     tasks = conf["tasks"]
     workers = conf["models"]["workers"]
@@ -980,13 +1059,13 @@ def plan(conf: dict, task_filter: str | None = None, model_filter: str | None = 
         task_filter = next((t["id"] for t in tasks if t.get("specificity") == "specific"), tasks[0]["id"])
     if smoke:
         if model_filter is not None or condition_filter is not None:
-            raise ValueError("--smoke always compares two models in both conditions; "
+            raise ValueError("--smoke always compares two models in all three conditions; "
                              "set experiment.smoke_models to choose models, or omit --smoke "
                              "to use --model/--condition")
         if repeats not in (None, 1):
             raise ValueError("--smoke requires one repeat; omit --repeats or set it to 1")
-        if not {"no_skills", "native"}.issubset(conditions):
-            raise ValueError("--smoke requires both no_skills and native conditions")
+        if not {"no_skills", "native", "no_skills_xtc"}.issubset(conditions):
+            raise ValueError("--smoke requires no_skills, native and no_skills_xtc conditions")
         configured = conf["experiment"].get("smoke_models")
         if configured is not None:
             if not isinstance(configured, list) or len(configured) != 2 or len(set(configured)) != 2:
@@ -1003,7 +1082,7 @@ def plan(conf: dict, task_filter: str | None = None, model_filter: str | None = 
                 rates = prices.get(workers[label])
                 return (3 * float(rates.get("input", 0)) + float(rates.get("output", 0))) if rates else float("inf")
             chosen_workers = sorted(workers, key=estimated_weighted_rate)[:2]
-        chosen_conditions = ["no_skills", "native"]
+        chosen_conditions = ["no_skills", "native", "no_skills_xtc"]
         repeats_final = 1
     else:
         chosen_workers = [label for label, model in workers.items()
@@ -1047,12 +1126,15 @@ def main() -> int:
     parser.add_argument("--skills-dir", type=Path, metavar="PATH",
                         help="Required for plan/run when native skills are selected; "
                         "path to xskills/skills (never configured in TOML)")
+    parser.add_argument("--xtc-env", type=Path, metavar="SCRIPT",
+                        help="Required for no_skills_xtc: macOS SetEnv.sh or Linux SetEnv "
+                             "activation script; only that condition inherits XTC")
     parser.add_argument("--task", help="Optional task ID filter")
     parser.add_argument("--model", help="Filter by worker alias (luna) or full OpenCode model ID")
-    parser.add_argument("--condition", help="Filter by condition (native, no_skills, later mcp)")
+    parser.add_argument("--condition", help="Filter by condition (native, no_skills, no_skills_xtc, later mcp)")
     parser.add_argument("--repeats", type=int, help="Override repeats per model/condition")
     parser.add_argument("--smoke", action="store_true", help="Quick complete comparison: one task, two configured workers, "
-                        "with and without native skills, one repeat, optional verifier and blind reviewer")
+                        "across native/no_skills/no_skills_xtc, one repeat, optional verifier and blind reviewer")
     parser.add_argument("--results", type=Path, help="Existing experiment directory for 'report'")
     parser.add_argument("--results-root", type=Path, default=BASE / "bench-results",
                         help="Persistent experiment archive directory (default: bench-results)")
@@ -1111,10 +1193,11 @@ def main() -> int:
     if not matrix:
         parser.error("No test cases match your selection")
     skills_dir = validate_skills_directory(args.skills_dir, matrix)
+    xtc_script = validate_xtc_script(args.xtc_env, matrix)
     preflight_inputs(matrix, config_path)
     if args.command == "plan":
         if args.smoke:
-            print("SMOKE PLAN (four worker trials, optional verification, and blind referee)")
+            print("SMOKE PLAN (six worker trials, optional verification, and blind referee)")
             if any(not task.get("verify_commands") for task, *_ in matrix):
                 print("NOTE: no verifier configured; trial correctness will be UNVERIFIED, but review still runs.")
         for t, name, model, condition, trial in matrix:
@@ -1137,6 +1220,14 @@ def main() -> int:
         print("WARNING: No independent verifier configured for " + ", ".join(unconfigured) +
               ". Correctness will be UNVERIFIED (not passed); the blind reviewer "
               "can still assess design quality.", flush=True)
+    # Verify cold/warm conditions and the XTC shell script BEFORE making model calls
+    # or writing an experiment directory. Source the script only for warm workers.
+    base_env = config_environment(conf, config_path)
+    ensure_cold_controls(base_env, matrix)
+    xtc_env = activated_xtc_environment(
+        base_env, xtc_script,
+        needs_xsim=any(t.get("kind") == "sim" for t, *rest in matrix)
+    ) if xtc_script else None
     exe = exp.get("opencode_command", "opencode")
     if not Path(exe).is_file() and shutil.which(exe) is None:
         raise ValueError(f"OpenCode executable not found: {exe}")
@@ -1147,12 +1238,14 @@ def main() -> int:
     run_options = {"smoke": args.smoke, "review_enabled": reviewer_enabled,
                    "allow_unverified": allow_unverified,
                    "native_skills_directory_supplied": skills_dir is not None,
+                   "xtc_activation_supplied": xtc_env is not None,
                    "model_filter": args.model, "condition_filter": args.condition,
                    "task_filter": args.task, "repeats_override": args.repeats}
     write_json(root / "experiment.json", {"experiment_id": root.name,
                                           "started_utc": now_iso(),
                                           "configuration_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
-                                          "environment": study_environment(conf, config_path, skills_dir),
+                                          "environment": study_environment(conf, config_path, skills_dir,
+                                                                           xtc_script, xtc_env),
                                           "report_config": report_config_snapshot(selected_conf,
                                               {t[0]["id"] for t in matrix}),
                                           "run_options": run_options,
@@ -1176,7 +1269,7 @@ def main() -> int:
         print(f"Results: {root}", flush=True)
         print(f"Results database: {db_path}", flush=True)
         if args.smoke:
-            print("SMOKE MODE: one problem; two worker models x two skills conditions; "
+            print("SMOKE MODE: one problem; two worker models x three conditions; "
                   "one repeat; independent blind reviewer ENABLED. "
                   "Independent verification optional; unconfigured tasks remain UNVERIFIED. "
                   "Real Copilot usage, including referee, may incur charges.", flush=True)
@@ -1191,7 +1284,7 @@ def main() -> int:
             print(f"[{i}/{len(matrix)} | {100*(i-1)/len(matrix):.0f}% complete] "
                   f"START {task['id']} | {label} | {cond} | trial {trial}", flush=True)
             result = run_one(conf, config_path, root, task, label, model, cond, trial,
-                             skills_dir=skills_dir,
+                             skills_dir=skills_dir, xtc_env=xtc_env,
                              progress=lambda message: print(message, flush=True),
                              progress_interval=progress_interval,
                              require_verifier_output=bool(args.smoke and task.get("verify_commands")))
