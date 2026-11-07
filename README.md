@@ -1,9 +1,6 @@
 # Gladiators
 
-**Are you not entertained?** — *Gladiator* (2000 film)
-
 *"Gladiators, you will go on my second whistle."* — John Anderson,
-referee on the British TV show *Gladiators*.
 
 **Gladiators** is an XMOS coding-agent benchmarking arena: multiple models face
 identical engineering challenges in separate workspaces, their results are

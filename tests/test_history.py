@@ -208,8 +208,8 @@ class HistoryTests(unittest.TestCase):
                      "repeat": 1, "validation": {"status": "passed"},
                      "invocation": {"elapsed_seconds": 50}, "usage": {"copilot_estimated_usd": 1.2}}
             text = b.report(root, self.conf, [entry], []).read_text(encoding="utf-8")
-            self.assertLess(text.index("Results - scoreboard"), text.index("Method at a glance"))
-            self.assertLess(text.index("The Duel"), text.index("Appendix - detailed evidence"))
+            self.assertLess(text.index("Results at a glance"), text.index("Method at a glance"))
+            self.assertLess(text.index("Did skills help?"), text.index("Appendix - detailed evidence"))
             self.assertNotIn("Size", text)
             self.assertNotIn("Not publicly disclosed", text)
             self.assertNotIn("parameter count", text.lower())
