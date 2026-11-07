@@ -82,6 +82,37 @@ strictly verified experiments are supported. Historical unchecked files are
 neither converted nor deleted. External Docutils/Sphinx/rst2pdf may render the
 RST; they are not dependencies of the benchmark runner.
 
+## Two-folder comparisons and reused observations
+
+`--compare-skills-dir` adds a third, separately installed skills condition.
+Reports label the original folder **Current skills + XTC** and the second folder
+**Comparison skills + XTC**; the no-skills reference remains visible. The paired
+comparison section uses comparison versus current skills, including explicit
+language-shift direction. C/XC percentages remain per condition with no overall
+row, and consultation flags are shown for both skills conditions.
+
+`--reuse-results` copies compatible verified trials, including failures, without
+rerunning workers or verification. Original evidence, times and usage are retained.
+A new blind review ranks the complete combined candidate set; old rankings are
+never copied. The report marks each result **New** or **Reused**, identifies the
+source experiment/run and original result hash, and separates historical worker
+usage from estimated new worker-plus-reviewer usage. New manifests record both
+skills folders' content fingerprints, not their filesystem paths or source text.
+
+Compatibility checks cover task/worker prompts, task revision, model, budgets,
+seed, verifier protocol/fingerprint, tool versions, activation script, pricing,
+starter and archived verified sources/receipts. Legacy archives with only
+`SKILL.md` hashes and git revision can be reused with matching values, but carry
+an explicit warning: auxiliary resources cannot be retrospectively attested.
+This is weaker provenance than a new full-resource fingerprint, not proof that
+all old resources matched. Model-provider drift and global-profile contamination
+also remain limitations.
+
+SQLite history shows reused counts and newly incurred estimated usage. Trend and
+comparison aggregates exclude reused rows so copied observations are not counted
+as extra repetitions; skill-content fingerprints separate different folder edits.
+The original experiment must be indexed for its observations to appear there.
+
 ## Future framework-authoring skills
 
 Evaluate simulation-framework generation in a distinct task class using

@@ -31,8 +31,22 @@ SECRET_SUFFIXES = {".pem", ".key", ".p12", ".pfx", ".token", ".credentials"}
 MAX_REVIEW_FILES = 120
 MAX_REVIEW_BYTES = 1_600_000
 SESSION_RE = re.compile(r"\bses_[a-zA-Z0-9_-]+\b")
-WARM_CONDITIONS = {"no_skills_xtc", "native_xtc"}
-NATIVE_CONDITIONS = {"native", "native_xtc"}
+WARM_CONDITIONS = {"no_skills_xtc", "native_xtc", "native_compare_xtc"}
+NATIVE_CONDITIONS = {"native", "native_xtc", "native_compare_xtc"}
+
+
+def comparison_config(conf: dict) -> dict:
+    from copy import deepcopy
+    chosen = deepcopy(conf)
+    if chosen["conditions"].get("native_xtc", {}).get("type") != "native":
+        raise ValueError("Skill-folder comparison requires the native_xtc current-skills condition")
+    chosen["conditions"]["native_xtc"]["display_name"] = "Current skills + XTC"
+    chosen["conditions"]["native_compare_xtc"] = {"type": "native", "display_name": "Comparison skills + XTC"}
+    for task in chosen["tasks"]:
+        conditions = task.setdefault("conditions", list(conf["conditions"]))
+        if "native_compare_xtc" not in conditions:
+            conditions.append("native_compare_xtc")
+    return chosen
 
 
 def require_verifier(task: dict) -> None:
@@ -72,13 +86,13 @@ def relpath(path: str, config_path: Path) -> Path:
     return (p if p.is_absolute() else config_path.parent / p).resolve()
 
 
-def validate_skills_directory(value: Path | None, matrix: list[tuple]) -> Path | None:
+def validate_skills_directory(value: Path | None, matrix: list[tuple], *, require_native: bool = False) -> Path | None:
     """Preflight native skill source BEFORE any Copilot call or experiment creation.
 
     The CLI argument is deliberately never read from benchmark.toml. Relative
     paths are resolved against the caller's current directory, not the TOML.
     """
-    requires_native = any(row[3] in NATIVE_CONDITIONS for row in matrix)
+    requires_native = require_native or any(row[3] in NATIVE_CONDITIONS for row in matrix)
     if value is None:
         if requires_native:
             raise ValueError("Native-skills trials require --skills-dir PATH "
@@ -749,6 +763,7 @@ def run_one(conf: dict, config_path: Path, result_root: Path, task: dict, model_
             snapshot = snapshot_project(workspace, run_dir / "source")
             result = {"run_id": run_id, "task_id": task["id"], "kind": task["kind"],
                       "model_label": model_label, "model": model, "condition": condition,
+                       "condition_label": conf["conditions"][condition].get("display_name"),
                        "xtc_preconfigured": condition in WARM_CONDITIONS,
                        "evaluation_class": task["evaluation_class"],
                        "task_revision": task["revision"],
@@ -776,6 +791,7 @@ def run_one(conf: dict, config_path: Path, result_root: Path, task: dict, model_
                          f"(details in {run_dir / 'harness-error.log'})")
             result = {"run_id": run_id, "task_id": task["id"], "model_label": model_label,
                       "model": model, "condition": condition, "repeat": repeat,
+                       "condition_label": conf["conditions"][condition].get("display_name"),
                        "xtc_preconfigured": condition in WARM_CONDITIONS,
                        "evaluation_class": task["evaluation_class"],
                        "task_revision": task["revision"],
@@ -951,7 +967,7 @@ def report_config_snapshot(conf: dict, selected_task_ids: set[str]) -> dict:
         "models": conf["models"],
         "model_profiles": conf.get("model_profiles", {}),
         "pricing": conf.get("pricing", {}),
-        "conditions": {name: {k: v[k] for k in ("type", "server_name") if k in v}
+        "conditions": {name: {k: v[k] for k in ("type", "server_name", "display_name") if k in v}
                        for name, v in conf["conditions"].items()},
         "tasks": safe_tasks,
     }
@@ -970,21 +986,19 @@ def probe_cli_version(argv: list[str], env: dict | None = None) -> str | None:
 
 
 def study_environment(conf: dict, config_path: Path, skills_dir: Path | None = None,
-                      xtc_script: Path | None = None, xtc_env: dict | None = None) -> dict:
+                      xtc_script: Path | None = None, xtc_env: dict | None = None,
+                      comparison_skills_dir: Path | None = None) -> dict:
     skills_revision = (probe_cli_version(["git", "-C", str(skills_dir),
                                           "rev-parse", "HEAD"]) if skills_dir else None)
     # Hash content, not the install location. This allows comparisons across
     # machines and over time without exposing a personal filesystem path.
-    skill_fingerprint = None
-    skill_count = 0
-    if skills_dir:
-        digest = hashlib.sha256()
-        for p in sorted(skills_dir.glob("*/SKILL.md")):
-            digest.update(str(p.relative_to(skills_dir)).encode("utf-8"))
-            digest.update(b"\x00")
-            digest.update(p.read_bytes())
-            skill_count += 1
-        skill_fingerprint = digest.hexdigest()
+    from experiment_reuse import skill_fingerprint
+    current = skill_fingerprint(skills_dir) if skills_dir else {"skills_sha256": None, "skills_count": 0}
+    current["xskills_revision"] = skills_revision
+    sources = {"native_xtc": current} if skills_dir else {}
+    if comparison_skills_dir:
+        sources["native_compare_xtc"] = skill_fingerprint(comparison_skills_dir) | {
+            "xskills_revision": probe_cli_version(["git", "-C", str(comparison_skills_dir), "rev-parse", "HEAD"])}
     from verification.uart_heartbeat import protocol
     return {
         "implementation_verifier": protocol() if any(t.get("verifier") for t in conf["tasks"]) else None,
@@ -998,8 +1012,8 @@ def study_environment(conf: dict, config_path: Path, skills_dir: Path | None = N
         "xtc_activation_script_sha256": (
             hashlib.sha256(xtc_script.read_bytes()).hexdigest() if xtc_script else None),
         "xskills_revision": skills_revision,
-        "skills_sha256": skill_fingerprint,
-        "skills_count": skill_count,
+        **current,
+        "skill_sources": sources,
     }
 
 
@@ -1135,12 +1149,16 @@ def main() -> int:
     parser.add_argument("--skills-dir", type=Path, metavar="PATH",
                         help="Required for plan/run when native skills are selected; "
                         "path to xskills/skills (never configured in TOML)")
+    parser.add_argument("--compare-skills-dir", type=Path, metavar="PATH",
+                        help="Add a separate native-skills condition from a second skills/ folder")
+    parser.add_argument("--reuse-results", type=Path, metavar="EXPERIMENT",
+                        help="Reuse matching independently checked worker trials; always run a fresh combined review")
     parser.add_argument("--xtc-env", type=Path, metavar="SCRIPT",
                         help="Required for warm conditions and implementation verification: "
                              "macOS SetEnv.sh or Linux SetEnv activation script")
     parser.add_argument("--task", help="Optional task ID filter")
     parser.add_argument("--model", help="Filter by worker alias (luna) or full OpenCode model ID")
-    parser.add_argument("--condition", help="Filter by condition (native_xtc, no_skills_xtc, native, no_skills)")
+    parser.add_argument("--condition", help="Filter by condition (native_xtc, native_compare_xtc, no_skills_xtc)")
     parser.add_argument("--repeats", type=int, help="Override repeats per model/condition")
     parser.add_argument("--smoke", action="store_true", help="One task, two workers, declared task conditions, "
                         "one repeat and blind review (four runs for implementation-v2)")
@@ -1193,20 +1211,26 @@ def main() -> int:
         finally:
             db.close()
         return 0
+    if args.compare_skills_dir:
+        conf = comparison_config(conf)
+    reviewer_enabled = bool(not args.no_review and (args.smoke or conf["experiment"].get("review_enabled", True)))
+    if args.reuse_results and not reviewer_enabled:
+        parser.error("--reuse-results requires a fresh blind review; enable review and omit --no-review")
     matrix = plan(conf, args.task, args.model, args.condition, args.repeats, args.smoke)
     if not matrix:
         parser.error("No test cases match your selection")
-    skills_dir = validate_skills_directory(args.skills_dir, matrix)
+    skills_dir = validate_skills_directory(args.skills_dir, matrix, require_native=bool(args.compare_skills_dir))
+    comparison_dir = validate_skills_directory(args.compare_skills_dir, matrix, require_native=True) if args.compare_skills_dir else None
+    if comparison_dir:
+        from experiment_reuse import skill_fingerprint
+        identical = skill_fingerprint(skills_dir)["skills_tree_sha256"] == skill_fingerprint(comparison_dir)["skills_tree_sha256"]
+        if identical:
+            message = "The two skills folders have identical contents; modify the comparison folder before running."
+            if args.command == "run":
+                raise ValueError(message + " No model calls were started.")
+            print("NOTE: " + message)
     xtc_script = validate_xtc_script(args.xtc_env, matrix)
     preflight_inputs(matrix, config_path)
-    if args.command == "plan":
-        if args.smoke:
-            print(f"SMOKE PLAN ({len(matrix)} worker trials and blind referee)")
-        for t, name, model, condition, trial in matrix:
-            print(f"{t['id']:26} {name:8} {model:42} {condition:12} r{trial}")
-        print(f"\n{len(matrix)} independent worker runs. Reviewer: "
-              + conf["models"]["reviewer"])
-        return 0
     exp = conf["experiment"]
     progress_interval = (args.progress_every if args.progress_every is not None else
                          float(exp.get("progress_interval_seconds", 20)))
@@ -1214,33 +1238,52 @@ def main() -> int:
         parser.error("--progress-every must be nonnegative")
     # Verify cold/warm conditions and the XTC shell script BEFORE making model calls
     # or writing an experiment directory. Source the script only for warm workers.
-    base_env = config_environment(conf, config_path)
-    ensure_cold_controls(base_env, matrix)
-    xtc_env = activated_xtc_environment(
-        base_env, xtc_script,
-        needs_xsim=any(t.get("kind") == "sim" for t, *rest in matrix)
-    ) if xtc_script else None
-    if any(t.get("verifier") for t, *_ in matrix):
+    environment = None
+    reuse = {}
+    xtc_env = None
+    if args.command == "run" or args.reuse_results:
+        base_env = config_environment(conf, config_path)
+        ensure_cold_controls(base_env, matrix)
+        xtc_env = activated_xtc_environment(base_env, xtc_script, needs_xsim=any(t.get("kind") == "sim" for t, *_ in matrix))
         from verification.uart_heartbeat import validate_toolchain
         validate_toolchain(xtc_env)
+        environment = study_environment(conf, config_path, skills_dir, xtc_script, xtc_env, comparison_dir)
+        if args.reuse_results:
+            from experiment_reuse import reusable_trials, trial_id
+            reuse = reusable_trials(args.reuse_results, matrix, conf, config_path, environment,
+                                    {trial_id(row): worker_prompt(row[0], config_path, row[3]) for row in matrix})
+            for note in sorted({note for record in reuse.values() for note in record["notes"]}):
+                print("REUSE WARNING: " + note)
+    if args.command == "plan":
+        from experiment_reuse import trial_id
+        if args.smoke:
+            print(f"SMOKE PLAN ({len(matrix)} submissions and blind referee)")
+        for row in matrix:
+            t, name, model, condition, trial = row
+            action = "REUSE" if trial_id(row) in reuse else "RUN"
+            print(f"{action:5} {t['id']:26} {name:8} {model:42} {condition:20} r{trial}")
+        print(f"\n{len(matrix)} submissions: {len(reuse)} reused, {len(matrix) - len(reuse)} new worker runs. "
+              + (f"Fresh reviewer: {conf['models']['reviewer']}" if reviewer_enabled else "Reviewer disabled."))
+        return 0
     exe = exp.get("opencode_command", "opencode")
     if not Path(exe).is_file() and shutil.which(exe) is None:
         raise ValueError(f"OpenCode executable not found: {exe}")
-    reviewer_enabled = bool(not args.no_review and (args.smoke or exp.get("review_enabled", True)))
     selected_conf = config_for_selected_matrix(conf, matrix, reviewer_enabled)
+    from experiment_reuse import tree_digest
     root = (results_root / (dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6])).resolve()
     root.mkdir(parents=True)
     run_options = {"smoke": args.smoke, "review_enabled": reviewer_enabled,
                     "verification_required": True,
                    "native_skills_directory_supplied": skills_dir is not None,
+                   "comparison_skills_directory_supplied": comparison_dir is not None,
+                   "reused_trials": len(reuse),
                    "xtc_activation_supplied": xtc_env is not None,
                    "model_filter": args.model, "condition_filter": args.condition,
                    "task_filter": args.task, "repeats_override": args.repeats}
     write_json(root / "experiment.json", {"experiment_id": root.name,
                                           "started_utc": now_iso(),
                                           "configuration_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
-                                          "environment": study_environment(conf, config_path, skills_dir,
-                                                                           xtc_script, xtc_env),
+                                          "environment": environment,
                                           "report_config": report_config_snapshot(selected_conf,
                                               {t[0]["id"] for t in matrix}),
                                           "run_options": run_options,
@@ -1254,6 +1297,8 @@ def main() -> int:
                                                             "prompt_sha256": hashlib.sha256(relpath(t["prompt"], config_path).read_bytes()).hexdigest()}
                                                            for t in selected_conf["tasks"]],
                                           "conditions": list(selected_conf["conditions"]),
+                                          "task_inputs": {t["id"]: {"starter_sha256": tree_digest(relpath(t["starter"], config_path))}
+                                                          for t in selected_conf["tasks"]},
                                           "seed": exp.get("seed"),
                                           "note": "No auth secrets or local skill contents are included in this manifest."})
     db = open_results_db(db_path)
@@ -1268,20 +1313,26 @@ def main() -> int:
                   "one repeat; independent blind reviewer ENABLED. "
                    "Uniform independent verification REQUIRED. "
                   "Real Copilot usage, including referee, may incur charges.", flush=True)
-        print(f"Gladiators: {len(matrix)} worker runs; {len({t[0]['id'] for t in matrix})} task(s); "
+        print(f"Gladiators: {len(matrix)} submissions ({len(reuse)} reused, {len(matrix) - len(reuse)} new workers); "
+              f"{len({t[0]['id'] for t in matrix})} task(s); "
               f"referee {'enabled' if reviewer_enabled else 'disabled'}; "
-              f"heartbeat every {progress_interval:g}s" if progress_interval else
-              f"Gladiators: {len(matrix)} worker runs; periodic heartbeat disabled", flush=True)
+              + (f"heartbeat every {progress_interval:g}s" if progress_interval else "periodic heartbeat disabled"), flush=True)
         if int(exp.get("parallel_sim_runs", 1)) != 1:
             print("NOTE: v1 deliberately runs sequentially, despite parallel_sim_runs; "
                   "fairness and shared Copilot throttling outweigh throughput.", flush=True)
         for i, (task, label, model, cond, trial) in enumerate(matrix, start=1):
             print(f"[{i}/{len(matrix)} | {100*(i-1)/len(matrix):.0f}% complete] "
                   f"START {task['id']} | {label} | {cond} | trial {trial}", flush=True)
-            result = run_one(conf, config_path, root, task, label, model, cond, trial,
-                             skills_dir=skills_dir, xtc_env=xtc_env,
-                             progress=lambda message: print(message, flush=True),
-                             progress_interval=progress_interval)
+            from experiment_reuse import trial_id, copy_trial
+            run_id = trial_id(matrix[i - 1])
+            if run_id in reuse:
+                result = copy_trial(reuse[run_id], root, conf["conditions"][cond].get("display_name"))
+                print(f"  [reuse] preserved worker/evidence from {result['reused_from']['experiment_id']}; no worker call", flush=True)
+            else:
+                source = comparison_dir if cond == "native_compare_xtc" else skills_dir
+                result = run_one(conf, config_path, root, task, label, model, cond, trial,
+                                 skills_dir=source, xtc_env=xtc_env,
+                                 progress=lambda message: print(message, flush=True), progress_interval=progress_interval)
             all_results.append(result)
             index_experiment(db, root)  # Keep partial results queryable if interrupted.
             if result.get("error"):

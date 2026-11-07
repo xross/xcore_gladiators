@@ -1,7 +1,6 @@
 # Gladiators
 
-*"Gladiators, you will go on my second whistle."* — John Anderson,
-referee on the British TV show *Gladiators*.
+*"Gladiators, you will go on my second whistle."* — John Anderson.
 
 Gladiators compares independent coding agents on xcore implementation quality.
 Workers run in separate OpenCode sessions through GitHub Copilot. Every
@@ -25,6 +24,7 @@ a separate trusted copy and fresh artifacts outside the worker workspace.
 |---|---|
 | `no_skills_xtc` | XTC preactivated; native skill loading denied |
 | `native_xtc` | Identical preactivated XTC plus the supplied XMOS skills |
+| `native_compare_xtc` (optional) | Same XTC plus a second supplied skills folder |
 
 Toolchain setup is controlled, not a separate quality score. Language,
 architecture, libraries and timing implementation remain engineering choices
@@ -56,6 +56,30 @@ There is **no unchecked-results mode**. Missing/unsupported verification fails
 before model calls; completed submissions receive independent pass/fail results.
 Worker/tool failures are execution errors, never passes. Old unchecked pilot
 results are not supported by current scoring/reporting. Files are not deleted.
+
+### Compare two skills folders, reusing verified baselines
+
+After editing the copied skills to remove C-promoting guidance:
+
+```sh
+python3 benchmark.py plan \
+  --skills-dir ~/Desktop/xskills/skills \
+  --compare-skills-dir ~/Desktop/xskills_xc/skills \
+  --reuse-results bench-results/20261107-021802-e7dfa6 \
+  --xtc-env /Applications/XMOS_XTC_15.3.1/SetEnv.sh
+```
+
+Replace `plan` with `run` when ready. With compatible inputs this reuses the six
+previous current-skills/no-skills trials, runs only three comparison-skills
+workers, and obtains a **new blind review of all nine submissions**. Neither
+the original archive nor either supplied skills folder is modified. Identical
+skills folders are allowed for planning but rejected for a paid run.
+
+Reuse checks prompts, models, budgets, verifier, environment, skills and archived
+source/evidence before any model calls. Old archives that fingerprinted only
+`SKILL.md` and git revision carry an explicit auxiliary-resource attestation
+warning. Reports distinguish historical from newly incurred usage; reused
+observations are not counted again as independent trials in trends/comparisons.
 
 ## Results
 

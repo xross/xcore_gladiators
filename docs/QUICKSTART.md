@@ -45,6 +45,48 @@ are no `--allow-unverified` or `--require-verification` switches: verification
 cannot be opted out of. Workers can fail acceptance or encounter execution
 errors, but cannot finish with an unchecked correctness outcome.
 
+## Compare current and edited skills
+
+Edit only the copied repository, for example `~/Desktop/xskills_xc`, to remove
+the language-promotion guidance you want to test. Pass its **skills/** subfolder,
+not the repository root. Both folders are copied into isolated worker workspaces;
+the supplied originals are never edited by the runner.
+
+```sh
+# Read-only preflight: no model calls or new results archive.
+python3 benchmark.py plan \
+  --skills-dir ~/Desktop/xskills/skills \
+  --compare-skills-dir ~/Desktop/xskills_xc/skills \
+  --reuse-results bench-results/20261107-021802-e7dfa6 \
+  --xtc-env /Applications/XMOS_XTC_15.3.1/SetEnv.sh
+
+# After the skills differ and the plan is satisfactory:
+python3 benchmark.py run \
+  --skills-dir ~/Desktop/xskills/skills \
+  --compare-skills-dir ~/Desktop/xskills_xc/skills \
+  --reuse-results bench-results/20261107-021802-e7dfa6 \
+  --xtc-env /Applications/XMOS_XTC_15.3.1/SetEnv.sh
+```
+
+The default comparison matrix has nine submissions: three models across
+`no_skills_xtc`, `native_xtc` (current) and `native_compare_xtc` (comparison).
+With the compatible six-trial archive above, the plan shows **six REUSE and
+three RUN** entries. Only the three comparison workers and one fresh combined
+reviewer incur new model usage. The existing failed submission remains failed;
+reuse does not select only successful attempts or recycle old rankings.
+
+Identical skill contents produce a planning warning and block `run`. Incompatible
+matching results also block before model calls; omit `--reuse-results` to run
+all nine workers afresh instead. Reuse requires review, so `--no-review` cannot
+be combined with it. Old SKILL.md-only fingerprints generate a warning because
+auxiliary resources cannot be retrospectively attested, even with matching git
+revision. New archives fingerprint the complete relevant skill-resource tree.
+
+Reuse copies evidence into a new archive with original experiment/run IDs and
+hashes. Original times and token usage remain available, but are marked historical,
+not newly incurred costs or fresh repetitions. Provider models may change behind
+the same model ID; reuse is an exploratory comparison, not a concurrent rerun.
+
 ## Common acceptance test
 
 See `tasks/uart-heartbeat/prompt-implementation-v2.md` for the public contract:

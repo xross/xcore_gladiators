@@ -75,6 +75,10 @@ def connect(db_path: Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_trials_prompt ON trials(prompt_sha256);
         CREATE INDEX IF NOT EXISTS idx_trials_date ON trials(started_utc);
     """)
+    columns = {row[1] for row in db.execute("PRAGMA table_info(trials)")}
+    for name, definition in (("is_reused", "INTEGER NOT NULL DEFAULT 0"), ("skills_fingerprint", "TEXT")):
+        if name not in columns:
+            db.execute(f"ALTER TABLE trials ADD COLUMN {name} {definition}")
     return db
 
 
@@ -161,7 +165,13 @@ def index_experiment(db: sqlite3.Connection, result_dir: Path) -> tuple[int, int
                   tokens.get("cache_read"),tokens.get("cache_write"),
                   usage.get("copilot_estimated_usd"),usage.get("copilot_estimated_ai_credits"),
                   len(trial.get("skill_calls") or []),int(bool(trial.get("requested_model_mismatch"))),
-                  trial.get("error"),str(file)))
+                   trial.get("error"),str(file)))
+            skill_source = env.get("skill_sources", {}).get(trial.get("condition"), {})
+            skill_hash = skill_source.get("skills_tree_sha256") or skill_source.get("skills_sha256")
+            if not skill_hash and trial.get("condition") in ("native", "native_xtc"):
+                skill_hash = env.get("skills_sha256")
+            db.execute("UPDATE trials SET is_reused=?,skills_fingerprint=? WHERE experiment_id=? AND run_id=?",
+                       (int(bool(trial.get("reused_from"))), skill_hash, experiment_id, trial["run_id"]))
             trial_count += 1
         for file in sorted((root / "reviews").glob("*/review-result.json")):
             review = _json(file)
@@ -199,7 +209,8 @@ def history(db: sqlite3.Connection, limit: int = 20) -> list[str]:
     query = """
       SELECT e.experiment_id, e.started_utc, e.smoke, e.planned_trials,
              COUNT(t.run_id) as completed, SUM(CASE WHEN t.verification_status='passed' THEN 1 ELSE 0 END) as passes,
-             ROUND(SUM(COALESCE(t.estimated_usd,0)),4) as worker_usd,
+             SUM(CASE WHEN t.is_reused=1 THEN 1 ELSE 0 END) as reused,
+             ROUND(SUM(CASE WHEN t.is_reused=0 THEN COALESCE(t.estimated_usd,0) ELSE 0 END),4) as worker_usd,
              (SELECT ROUND(SUM(COALESCE(v.estimated_usd,0)),4) FROM reviews v
               WHERE v.experiment_id=e.experiment_id) as referee_usd,
              e.report_path
@@ -211,12 +222,12 @@ def history(db: sqlite3.Connection, limit: int = 20) -> list[str]:
     rows = db.execute(query, (limit,)).fetchall()
     if not rows:
         return ["No experiments indexed. Run a benchmark or use: python3 benchmark.py index"]
-    out = ["Experiment ID               Date (UTC)           Mode     Done/plan Verified  Est. USD Report"]
+    out = ["Experiment ID               Date (UTC)           Mode     Done/plan Verified Reused Est.new USD Report"]
     for row in rows:
         cost = (row["worker_usd"] or 0) + (row["referee_usd"] or 0)
         out.append(f"{row['experiment_id'][:27]:27} {(row['started_utc'] or '')[:19]:19} "
                    f"{'SMOKE' if row['smoke'] else 'full':8} {row['completed']:2}/{_fmt(row['planned_trials']):4} "
-                   f"{row['passes']:3}       ${cost:8.4f} "
+                   f"{row['passes']:3}      {row['reused'] or 0:3}   ${cost:8.4f} "
                    f"{row['report_path'] or '(pending)'}")
     return out
 
@@ -224,7 +235,7 @@ def history(db: sqlite3.Connection, limit: int = 20) -> list[str]:
 def trend(db: sqlite3.Connection, task: str | None = None, model: str | None = None,
           condition: str | None = None, limit: int = 40) -> list[str]:
     """Time-ordered individual trials; prompt hash prevents accidental comparisons."""
-    filters, args = ["t.verification_status IN ('passed','failed','error')"], []
+    filters, args = ["t.verification_status IN ('passed','failed','error')", "t.is_reused=0"], []
     if task:
         filters.append("t.task_id = ?")
         args.append(task)
@@ -256,7 +267,7 @@ def trend(db: sqlite3.Connection, task: str | None = None, model: str | None = N
 
 def compare(db: sqlite3.Connection, task: str | None = None, model: str | None = None,
             condition: str | None = None) -> list[str]:
-    filters, args = ["t.verification_status IN ('passed','failed','error')"], []
+    filters, args = ["t.verification_status IN ('passed','failed','error')", "t.is_reused=0"], []
     if task:
         filters.append("t.task_id = ?")
         args.append(task)
@@ -268,26 +279,28 @@ def compare(db: sqlite3.Connection, task: str | None = None, model: str | None =
         args.append(condition)
     where = (" WHERE " + " AND ".join(filters)) if filters else ""
     rows = db.execute(f"""
-      SELECT t.task_id,t.model_id,t.condition,t.prompt_sha256,
+      SELECT t.task_id,t.model_id,t.condition,t.prompt_sha256,t.skills_fingerprint,
              COUNT(*) as n, SUM(t.verification_status='passed') as passes,
               SUM(t.verification_status IN ('passed','failed')) as checked,
              ROUND(AVG(t.worker_seconds),1) as avg_worker_s,
              ROUND(AVG(t.estimated_usd),4) as avg_usd,
              MIN(e.started_utc) as first_run,MAX(e.started_utc) as last_run
       FROM trials t JOIN experiments e USING(experiment_id)
-      {where} GROUP BY t.task_id,t.model_id,t.condition,t.prompt_sha256
-      ORDER BY t.task_id,t.model_id,t.condition,t.prompt_sha256
+       {where} GROUP BY t.task_id,t.model_id,t.condition,t.prompt_sha256,t.skills_fingerprint
+       ORDER BY t.task_id,t.model_id,t.condition,t.prompt_sha256,t.skills_fingerprint
     """, tuple(args)).fetchall()
     if not rows:
         return ["No comparable trials indexed."]
-    out = ["Task                     Model                        Condition    N   Pass/checked   Avg(s) Est.USD Prompt hash First..last"]
+    out = ["Task                     Model                        Condition    N   Pass/checked   Avg(s) Est.USD Prompt hash Skills hash First..last"]
     for r in rows:
         out.append(f"{r['task_id'][:24]:24} {r['model_id'][:28]:28} "
                    f"{r['condition'][:12]:12} {r['n']:3} "
                    f"{r['passes'] or 0:3}/{r['checked'] or 0:<8} "
                    f"{_fmt(r['avg_worker_s'],1):>6} {_fmt(r['avg_usd'],4):>7} "
                    f"{(r['prompt_sha256'] or 'n/a')[:11]:11} "
+                   f"{(r['skills_fingerprint'] or 'n/a')[:11]:11} "
                    f"{(r['first_run'] or '')[:10]}..{(r['last_run'] or '')[:10]}")
-    out.append("Failed and errored trials must not be counted as passing. "
+    out.append("Reused records are excluded from trend/comparison counts; they are not independent repetitions. "
+               "Failed and errored trials must not be counted as passing. "
                "Prompt hashes identify task wording; review verifier revisions before trend claims.")
     return out
