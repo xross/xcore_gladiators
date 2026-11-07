@@ -28,7 +28,10 @@ elif args[:1] == ["run"]:
             "ranked_ids": names, "review_notes": "fake test"}
         (w / "review.json").write_text(json.dumps(data))
     else:
-        (w / "main.c").write_text("int main(void){return 0;}\n")
+        (w / "src").mkdir(exist_ok=True)
+        (w / "src" / "main.c").write_text("int main(void){return 0;}\n")
+        (w / "tests").mkdir(exist_ok=True)
+        (w / "tests" / "test_candidate.py").write_text("# Not an implementation deliverable\n")
         (w / "DESIGN.md").write_text("# Demo\nUnknown threads and memory.")
     print(json.dumps({"type": "step_start", "sessionID": "ses_fake01", "part": {"type": "step-start"}}))
 else:

@@ -25,12 +25,23 @@ from pathlib import Path
 from typing import Callable
 
 BASE = Path(__file__).resolve().parent
-SKIP_NAMES = {".git", ".opencode", ".claude", ".agents", ".venv", "__pycache__", "node_modules", "build", "bin", ".cache", ".pytest_cache"}
-SKIP_SNAPSHOT_FILES = {"opencode.json", "opencode.jsonc", "benchmark-verification.json", "REVIEW_INSTRUCTIONS.md", "AGENTS.md", "CLAUDE.md"}
+SKIP_NAMES = {".git", ".opencode", ".claude", ".agents", ".venv", "__pycache__", "node_modules", "build", "build_verify", "bin", ".cache", ".pytest_cache", ".benchmark-check"}
+SKIP_SNAPSHOT_FILES = {"opencode.json", "opencode.jsonc", "benchmark-verification.json", "benchmark_check.py", "REVIEW_INSTRUCTIONS.md", "AGENTS.md", "CLAUDE.md"}
 SECRET_SUFFIXES = {".pem", ".key", ".p12", ".pfx", ".token", ".credentials"}
 MAX_REVIEW_FILES = 120
 MAX_REVIEW_BYTES = 1_600_000
 SESSION_RE = re.compile(r"\bses_[a-zA-Z0-9_-]+\b")
+WARM_CONDITIONS = {"no_skills_xtc", "native_xtc"}
+NATIVE_CONDITIONS = {"native", "native_xtc"}
+
+
+def require_verifier(task: dict) -> None:
+    from verification.uart_heartbeat import VERSION
+    if task.get("evaluation_class") != "implementation" or task.get("verifier") != VERSION:
+        raise ValueError(f"Task {task.get('id', '?')} requires a supported independent implementation verifier. "
+                         "Unverified tasks are not supported. No model calls were started.")
+    if task.get("verify_commands"):
+        raise ValueError("Candidate/custom verify_commands are not supported; use the harness-owned verifier")
 
 
 def load_config(path: Path) -> dict:
@@ -51,6 +62,8 @@ def load_config(path: Path) -> dict:
     for model in [reviewer, *workers.values()]:
         if not model.startswith("github-copilot/"):
             raise ValueError(f"This experiment requires GitHub Copilot models: {model}")
+    for task in conf["tasks"]:
+        require_verifier(task)
     return conf
 
 
@@ -65,7 +78,7 @@ def validate_skills_directory(value: Path | None, matrix: list[tuple]) -> Path |
     The CLI argument is deliberately never read from benchmark.toml. Relative
     paths are resolved against the caller's current directory, not the TOML.
     """
-    requires_native = any(row[3] == "native" for row in matrix)
+    requires_native = any(row[3] in NATIVE_CONDITIONS for row in matrix)
     if value is None:
         if requires_native:
             raise ValueError("Native-skills trials require --skills-dir PATH "
@@ -97,11 +110,11 @@ def validate_skills_directory(value: Path | None, matrix: list[tuple]) -> Path |
 
 def validate_xtc_script(value: Path | None, matrix: list[tuple]) -> Path | None:
     """Require a toolchain activation script for the preconfigured-XTC control."""
-    required = any(row[3] == "no_skills_xtc" for row in matrix)
+    required = any(row[3] in WARM_CONDITIONS or row[0].get("verifier") for row in matrix)
     if not required:
         return None
     if value is None:
-        raise ValueError("no_skills_xtc trials require --xtc-env /path/to/SetEnv.sh "
+        raise ValueError("Preactivated-XTC trials / built-in verification require --xtc-env /path/to/SetEnv.sh "
                          "(XTC activation script). No model calls were started.")
     path = value.expanduser().resolve()
     if not path.is_file():
@@ -178,11 +191,7 @@ def preflight_inputs(matrix: list[tuple], config_path: Path) -> None:
             raise ValueError(f"Missing task prompt: {prompt}. No model calls were started.")
         if not starter.is_dir():
             raise ValueError(f"Missing task starter directory: {starter}. No model calls were started.")
-        commands = task.get("verify_commands", [])
-        if not isinstance(commands, list) or any(not isinstance(cmd, str) or not cmd.strip()
-                                                 for cmd in commands):
-            raise ValueError(f"Invalid verify_commands for {task['id']}: expected non-empty "
-                             "shell commands. No model calls were started.")
+        require_verifier(task)
 
 
 def config_environment(conf: dict, config_path: Path) -> dict:
@@ -292,7 +301,7 @@ def prepare_project(workspace: Path, task: dict, config_path: Path, condition: s
                     conf: dict, skills_dir: Path | None = None) -> tuple[Path, list[str]]:
     copy_project(relpath(task["starter"], config_path), workspace)
     warnings: list[str] = []
-    if condition == "native":
+    if condition in NATIVE_CONDITIONS:
         if skills_dir is None:
             raise ValueError("Native trial missing the required --skills-dir PATH")
         src = skills_dir.resolve()
@@ -310,7 +319,7 @@ def prepare_project(workspace: Path, task: dict, config_path: Path, condition: s
         {"action": "external_directory", "resource": "*", "effect": "deny"},
         {"action": "question", "resource": "*", "effect": "deny"},
     ]
-    if condition != "native":
+    if condition not in NATIVE_CONDITIONS:
         perms.append({"action": "skill", "resource": "*", "effect": "deny"})
     opencode_conf: dict = {"$schema": "https://opencode.ai/config.json", "permissions": perms}
     if conf["conditions"][condition]["type"] == "mcp":
@@ -319,6 +328,10 @@ def prepare_project(workspace: Path, task: dict, config_path: Path, condition: s
         opencode_conf["mcp"] = {"servers": {c.get("server_name", "xcore-skills"): {
             "type": "remote", "url": c["url"], "enabled": True}}}
     write_json(workspace / "opencode.json", opencode_conf)
+    if task.get("verifier"):
+        # This copy is convenient worker feedback only. Final verification imports
+        # the harness module, never the potentially modified worker copy.
+        shutil.copyfile(BASE / "verification" / "uart_heartbeat.py", workspace / "benchmark_check.py")
     if not conf["experiment"].get("clean_home"):
         warnings.append("No clean_home configured: global agent settings/skills or plugins could contaminate this run")
     warnings.append("Host-process execution is not a security sandbox; shell tools can bypass OpenCode path checks")
@@ -345,10 +358,14 @@ def worker_prompt(task: dict, config_path: Path, condition: str) -> str:
     )
     if condition in ("no_skills", "no_skills_xtc"):
         context += "This is a NO-SKILLS control: do not load any skill or skill catalogue.\n"
-    elif condition == "native":
+    elif condition in NATIVE_CONDITIONS:
         context += "Native XMOS agent skills are installed in this project. Consult relevant native skills.\n"
     else:
         context += "XMOS instructions are available through MCP. Consult relevant MCP tools.\n"
+    if task.get("evaluation_class") == "implementation":
+        context += ("This is an IMPLEMENTATION-ONLY task. The harness provides identical acceptance tests.\n"
+                    "Do not spend time authoring a test framework; your tests, their count and their length are not scored.\n"
+                    "You may run the supplied benchmark_check.py for feedback; final verification uses a separate trusted copy.\n")
     return context + "\nTASK:\n" + prompt + "\nWhen finished, briefly summarize verified results and remaining risks.\n"
 
 
@@ -598,70 +615,15 @@ def session_usage(export: object, events: list[dict], pricing: dict | None) -> d
 
 def verify_candidate(task: dict, workspace: Path, env: dict, run_dir: Path, timeout: int,
                      progress: Callable[[str], None] | None = None,
-                     progress_interval: float = 20.0,
-                     require_verifier_output: bool = False) -> dict:
-    commands = task.get("verify_commands", [])
-    if not commands:
-        return {"status": "unverified", "reason": "No independent verifier configured", "elapsed_seconds": 0}
-    start = time.monotonic()
-    log_path = run_dir / "validator.log"
-    all_ok = True
-    steps = []
-    # A worker could have fabricated this filename. Remove it BEFORE running
-    # trusted independent validation, so only the verifier may recreate it.
-    results_file = workspace / "benchmark-verification.json"
-    if results_file.exists():
-        results_file.unlink()
-    with log_path.open("w", encoding="utf-8") as log:
-        for i, cmd in enumerate(commands, start=1):
-            if progress:
-                progress(f"  [verifier {i}/{len(commands)}] running independent check")
-            log.write(f"\n$ {cmd}\n")
-            log.flush()
-            try:
-                child_env = dict(env)
-                child_env["PWD"] = str(workspace.resolve())
-                kwargs = {"cwd": str(workspace), "env": child_env, "shell": True,
-                          "stdout": log, "stderr": subprocess.STDOUT}
-                if os.name != "nt":
-                    kwargs["start_new_session"] = True
-                proc = subprocess.Popen(cmd, **kwargs)
-                result = wait_with_progress(
-                    proc, cmd, timeout,
-                    (lambda elapsed, step=i: progress(
-                        f"  [verifier {step}/{len(commands)}] {elapsed_display(elapsed)} elapsed; still running"))
-                    if progress else None, progress_interval)
-                steps.append({"command": cmd, "exit_code": result["exit_code"],
-                              "timeout": result["timed_out"]})
-                if progress:
-                    progress(f"  [verifier {i}/{len(commands)}] exit={result['exit_code']} "
-                             f"after {elapsed_display(result['elapsed_seconds'])}")
-                if result["exit_code"] != 0:
-                    all_ok = False
-                    break
-            except OSError as exc:
-                log.write(f"Verifier could not be started: {exc}\n")
-                steps.append({"command": cmd, "start_error": str(exc)})
-                all_ok = False
-                break
-    data = {"status": "passed" if all_ok else "failed", "elapsed_seconds": round(time.monotonic() - start, 2), "steps": steps}
-    if results_file.is_file():
-        try:
-            result = json.loads(results_file.read_text(encoding="utf-8"))
-            if not isinstance(result, dict) or not isinstance(result.get("passed"), bool):
-                raise ValueError("verifier JSON must contain boolean passed")
-            data["observations"] = result
-            if result["passed"] is False:
-                data["status"] = "failed"
-        except (ValueError, TypeError) as exc:
-            data["invalid_metrics_json"] = True
-            data["reason"] = f"Invalid independent verifier output: {exc}"
-            data["status"] = "failed"
-    elif require_verifier_output:
-        data["status"] = "failed"
-        data["reason"] = ("Smoke requires independent verifier evidence: "
-                          "no benchmark-verification.json was generated by the verifier")
-    return data
+                     progress_interval: float = 20.0) -> dict:
+    from verification.uart_heartbeat import verify, validate_observations
+    require_verifier(task)
+    started = time.monotonic()
+    observed = verify(workspace, run_dir / "verification", env, timeout, progress)
+    validate_observations(observed)
+    return {"status": "passed" if observed["passed"] else "failed",
+            "elapsed_seconds": round(time.monotonic() - started, 2),
+            "reason": observed.get("reason"), "observations": observed}
 
 
 def snapshot_project(src: Path, dest: Path, include_build: bool = False) -> dict:
@@ -690,13 +652,13 @@ def run_one(conf: dict, config_path: Path, result_root: Path, task: dict, model_
             model: str, condition: str, repeat: int, skills_dir: Path | None = None,
             progress: Callable[[str], None] | None = None,
             progress_interval: float = 20.0,
-            require_verifier_output: bool = False,
             xtc_env: dict | None = None) -> dict:
+    require_verifier(task)
     run_id = f"{task['id']}--{model_label}--{condition}--r{repeat}"
     run_dir = result_root / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     env = config_environment(conf, config_path)
-    if condition == "no_skills_xtc":
+    if condition in WARM_CONDITIONS:
         if xtc_env is None:
             raise ValueError("No-skills+XTC trial requires a successfully preactivated XTC environment")
         env = dict(xtc_env)
@@ -763,22 +725,19 @@ def run_one(conf: dict, config_path: Path, result_root: Path, task: dict, model_
                 execution_error = (f"OpenCode worker exited with code {invocation['exit_code']}. "
                                    f"See {run_dir / 'stderr.log'} and {run_dir / 'events.jsonl'}")
             if execution_error:
-                # Do not confuse a failed agent process with a completed but
-                # unverified implementation. Preserve its recorded usage/logs.
+                # A failed agent process is an execution error, not a verifier pass.
                 verifier = {"status": "error", "reason": execution_error, "elapsed_seconds": 0}
                 if progress:
                     progress(f"  [error] {execution_error}")
             else:
                 if progress:
-                    progress("  [verify] checking independent correctness" if task.get("verify_commands")
-                             else "  [verify] no trusted verifier configured; will mark UNVERIFIED")
+                    progress("  [verify] checking independent correctness with the uniform verifier")
                 # The trusted verifier receives the same available XTC environment
                 # for EVERY condition. Only the worker's environment differs.
                 verifier_env = xtc_env if xtc_env is not None else config_environment(conf, config_path)
                 verifier = verify_candidate(task, workspace, verifier_env, run_dir,
                                             int(exp.get("verifier_timeout_seconds", 900)),
-                                            progress=progress, progress_interval=progress_interval,
-                                            require_verifier_output=require_verifier_output)
+                                            progress=progress, progress_interval=progress_interval)
             if progress:
                 usage_str = (f"{usage['copilot_estimated_ai_credits']:.3f} estimated Copilot AI Credits"
                              if usage.get("copilot_estimated_ai_credits") is not None
@@ -790,7 +749,9 @@ def run_one(conf: dict, config_path: Path, result_root: Path, task: dict, model_
             snapshot = snapshot_project(workspace, run_dir / "source")
             result = {"run_id": run_id, "task_id": task["id"], "kind": task["kind"],
                       "model_label": model_label, "model": model, "condition": condition,
-                      "xtc_preconfigured": condition == "no_skills_xtc",
+                       "xtc_preconfigured": condition in WARM_CONDITIONS,
+                       "evaluation_class": task["evaluation_class"],
+                       "task_revision": task["revision"],
                       "task_family": task.get("family", task["id"]),
                       "prompt_specificity": task.get("specificity", "unspecified"),
                       "prompt_sha256": hashlib.sha256(relpath(task["prompt"], config_path).read_bytes()).hexdigest(),
@@ -815,7 +776,9 @@ def run_one(conf: dict, config_path: Path, result_root: Path, task: dict, model_
                          f"(details in {run_dir / 'harness-error.log'})")
             result = {"run_id": run_id, "task_id": task["id"], "model_label": model_label,
                       "model": model, "condition": condition, "repeat": repeat,
-                      "xtc_preconfigured": condition == "no_skills_xtc",
+                       "xtc_preconfigured": condition in WARM_CONDITIONS,
+                       "evaluation_class": task["evaluation_class"],
+                       "task_revision": task["revision"],
                       "task_family": task.get("family", task["id"]),
                       "prompt_specificity": task.get("specificity", "unspecified"),
                       "started_utc": stamp, "error": f"{type(exc).__name__}: {exc}",
@@ -835,10 +798,43 @@ def anonymize_candidates(results: list[dict], seed: int, task_id: str) -> list[d
     return [{"alias": f"candidate_{i+1:02d}", "run": r} for i, r in enumerate(candidates)]
 
 
+def review_guidelines(task: dict) -> str:
+    require_verifier(task)
+    ratings = ["architecture", "real_time_correctness", "maintainability", "resource_efficiency", "xmos_idioms"]
+    scope = ("This is an IMPLEMENTATION-ONLY review. Rank the xcore application, not test-framework authoring. "
+             "Do not reward candidate test counts, framework sophistication, extra simulations, or chosen test duration. "
+             "Candidate-authored tests are excluded from the review bundle. Use the identical harness verification "
+             "results for correctness evidence; assess architecture, hardware timing, resources and maintainability. ")
+    schema = {"candidates": [{"id": "candidate_01", "ratings": {key: 0 for key in ratings},
+                             "threads_per_tile": None, "libraries": [], "ram_bytes_per_tile": None,
+                             "major_decisions": [], "risks": [], "summary": "..."}],
+              "ranked_ids": ["candidate_01"], "review_notes": "..."}
+    return ("You are an independent, expert XMOS/XCORE code reviewer. Examine the implementations "
+            "under candidates/ and the specification in task.md. Candidate labels are BLIND: "
+            "you are not told the model or whether any skills were available. Do not try to infer identities. "
+            "Assess only the source and trusted verifier results, not self-reported claims. "
+            "Do not execute unknown source. Do not edit candidate source. " + scope +
+            "Assign integer ratings 0-5 for " + ", ".join(ratings) + ". "
+            "A failing candidate must not be called passed. Explicitly discuss logical core "
+            "allocation, libraries, RAM if established, timing risks, major decisions and rank rationale. "
+            "Use null for unknown measurements. Write VALID JSON to review.json with this schema: " +
+            json.dumps(schema) + ". Use ALL candidate IDs and rank them best first. Include specific evidence. "
+            "Do not include invented measurements. Write only review.json outside candidate trees.")
+
+
 def judge_task(conf: dict, config_path: Path, root: Path, task: dict, results: list[dict],
                progress: Callable[[str], None] | None = None,
                progress_interval: float = 20.0) -> dict:
+    require_verifier(task)
+    from verification.uart_heartbeat import validate_observations
     task_results = [r for r in results if r["task_id"] == task["id"]]
+    for r in task_results:
+        validation = r.get("validation", {})
+        if validation.get("status") == "error":
+            continue
+        if validation.get("status") not in ("passed", "failed"):
+            raise ValueError("Blind review requires independent verification results for every candidate")
+        validate_observations(validation.get("observations"))
     candidates = anonymize_candidates(results, int(conf["experiment"].get("seed", 1)), task["id"])
     if len(candidates) < len(task_results):
         if progress:
@@ -859,28 +855,15 @@ def judge_task(conf: dict, config_path: Path, root: Path, task: dict, results: l
         alias, r = c["alias"], c["run"]
         dest = judge_work / "candidates" / alias
         dest.mkdir(parents=True, exist_ok=True)
-        snapshot_project(root / "runs" / r["run_id"] / "source", dest / "source")
+        source = root / "runs" / r["run_id"] / "source"
+        snapshot_project(source / "src", dest / "source" / "src")
+        for name in ("submission.json", "DESIGN.md"):
+            if (source / name).is_file() and not (source / name).is_symlink():
+                shutil.copyfile(source / name, dest / "source" / name)
         # Objective evidence, without worker model/condition/usage/timing.
         write_json(dest / "verification.json", r["validation"])
     (judge_work / "task.md").write_text(relpath(task["prompt"], config_path).read_text(encoding="utf-8"), encoding="utf-8")
-    guidelines = ("You are an independent, expert XMOS/XCORE code reviewer. Examine the implementations "
-                  "under candidates/ and the specification in task.md. Candidate labels are BLIND: "
-                  "you are not told the model or whether any skills were available. Do not try to infer identities. "
-                  "Assess only the source and trusted verifier results, not self-reported claims. "
-                  "Do not execute unknown source. Do not edit candidate source. "
-                  "Assign each candidate integer ratings 0-5 for architecture, real_time_correctness, "
-                  "maintainability, testing_quality, resource_efficiency, and xmos_idioms. "
-                  "A failing/unverified candidate must not be called verified. Explicitly discuss logical "
-                  "core allocation, libraries, RAM if established, timing risks, major design decisions, "
-                  "and why one candidate is better. Use null for unknown measurements. "
-                  "Write a VALID JSON file review.json containing {\"candidates\": [{\"id\":\"candidate_01\", "
-                  "\"ratings\": {\"architecture\":0, \"real_time_correctness\":0, \"maintainability\":0, "
-                  "\"testing_quality\":0, \"resource_efficiency\":0, \"xmos_idioms\":0}, "
-                  "\"threads_per_tile\":null, \"libraries\":[], \"ram_bytes_per_tile\":null, "
-                  "\"major_decisions\":[], \"risks\":[], \"summary\":\"...\"}], "
-                  "\"ranked_ids\":[\"candidate_01\"], \"review_notes\":\"...\"}. "
-                  "Use ALL candidate IDs and rank them best first. Include specific evidence. "
-                  "Do not include invented measurements. Write only review.json outside candidate trees.")
+    guidelines = review_guidelines(task)
     (judge_work / "REVIEW_INSTRUCTIONS.md").write_text(guidelines, encoding="utf-8")
     judge_conf = {"$schema": "https://opencode.ai/config.json", "permissions": [
         {"action": "skill", "resource": "*", "effect": "deny"},
@@ -923,6 +906,8 @@ def judge_task(conf: dict, config_path: Path, root: Path, task: dict, results: l
             review_data = json.loads(review_file.read_text(encoding="utf-8"))
             if not isinstance(review_data, dict) or not isinstance(review_data.get("candidates"), list):
                 review_data = None
+            elif any("testing_quality" in c.get("ratings", {}) for c in review_data["candidates"] if isinstance(c, dict)):
+                review_data = None
         except ValueError:
             pass
     actual_judge_models = observed_models(exported)
@@ -930,6 +915,8 @@ def judge_task(conf: dict, config_path: Path, root: Path, task: dict, results: l
     status = ("reviewer_model_mismatch" if reviewer_model_match is False else
               "reviewed" if review_data else "review_missing_or_invalid")
     result = {"task_id": task["id"], "status": status,
+              "evaluation_class": task["evaluation_class"],
+              "task_revision": task["revision"],
               "reviewer_model": model, "observed_models": actual_judge_models,
               "reviewer_model_match": reviewer_model_match,
               "invocation": invocation, "session_id": session_id,
@@ -956,8 +943,9 @@ def report_config_snapshot(conf: dict, selected_task_ids: set[str]) -> dict:
     for t in conf["tasks"]:
         if t["id"] not in selected_task_ids:
             continue
-        safe_tasks.append({k: t[k] for k in ("id", "family", "specificity", "kind", "rationale", "prompt") if k in t}
-                          | {"verifier_configured": bool(t.get("verify_commands"))})
+        safe_tasks.append({k: t[k] for k in ("id", "family", "specificity", "kind", "rationale", "prompt",
+                                            "evaluation_class", "revision", "verifier", "conditions") if k in t}
+                          | {"verifier_configured": True})
     return {
         "experiment": safe_exp,
         "models": conf["models"],
@@ -997,7 +985,9 @@ def study_environment(conf: dict, config_path: Path, skills_dir: Path | None = N
             digest.update(p.read_bytes())
             skill_count += 1
         skill_fingerprint = digest.hexdigest()
+    from verification.uart_heartbeat import protocol
     return {
+        "implementation_verifier": protocol() if any(t.get("verifier") for t in conf["tasks"]) else None,
         "python_version": sys.version.split()[0],
         "platform": sys.platform,
         "opencode_version": probe_cli_version([conf["experiment"].get("opencode_command", "opencode"), "--version"]),
@@ -1050,10 +1040,8 @@ def plan(conf: dict, task_filter: str | None = None, model_filter: str | None = 
          smoke: bool = False) -> list[tuple[dict, str, str, str, int]]:
     """Build an independent run matrix, optionally reduced for a cheap trial.
 
-    --smoke chooses one task (preferring a specific prompt), exactly two
-    configured worker models (experiment.smoke_models, or the two lowest-cost
-    by recorded token-price assumptions), and all three conditions
-    (no_skills, native, no_skills_xtc), with one repeat and blind review.
+    --smoke chooses one enabled task, two workers, and that task's declared
+    conditions. Implementation-v2 compares two warm conditions (four runs).
     """
     tasks = conf["tasks"]
     workers = conf["models"]["workers"]
@@ -1066,17 +1054,22 @@ def plan(conf: dict, task_filter: str | None = None, model_filter: str | None = 
         raise ValueError(f"Unknown condition '{condition_filter}'. Available: {', '.join(conditions)}")
     if repeats is not None and repeats < 1:
         raise ValueError("--repeats must be a positive integer")
+    enabled_tasks = [t for t in tasks if t.get("enabled", True)]
     if smoke and task_filter is None:
-        task_filter = next((t["id"] for t in tasks if t.get("specificity") == "specific"), tasks[0]["id"])
+        if not enabled_tasks:
+            raise ValueError("No enabled tasks")
+        task_filter = next((t["id"] for t in enabled_tasks if t.get("specificity") == "specific"), enabled_tasks[0]["id"])
     if smoke:
         if model_filter is not None or condition_filter is not None:
-            raise ValueError("--smoke always compares two models in all three conditions; "
+            raise ValueError("--smoke always compares two models in the task's declared conditions; "
                              "set experiment.smoke_models to choose models, or omit --smoke "
                              "to use --model/--condition")
         if repeats not in (None, 1):
             raise ValueError("--smoke requires one repeat; omit --repeats or set it to 1")
-        if not {"no_skills", "native", "no_skills_xtc"}.issubset(conditions):
-            raise ValueError("--smoke requires no_skills, native and no_skills_xtc conditions")
+        smoke_task = next(t for t in tasks if t["id"] == task_filter)
+        smoke_conditions = smoke_task.get("conditions", list(conditions))
+        if not set(smoke_conditions).issubset(conditions):
+            raise ValueError("--smoke task refers to unconfigured conditions")
         configured = conf["experiment"].get("smoke_models")
         if configured is not None:
             if not isinstance(configured, list) or len(configured) != 2 or len(set(configured)) != 2:
@@ -1093,7 +1086,7 @@ def plan(conf: dict, task_filter: str | None = None, model_filter: str | None = 
                 rates = prices.get(workers[label])
                 return (3 * float(rates.get("input", 0)) + float(rates.get("output", 0))) if rates else float("inf")
             chosen_workers = sorted(workers, key=estimated_weighted_rate)[:2]
-        chosen_conditions = ["no_skills", "native", "no_skills_xtc"]
+        chosen_conditions = smoke_conditions
         repeats_final = 1
     else:
         chosen_workers = [label for label, model in workers.items()
@@ -1104,9 +1097,14 @@ def plan(conf: dict, task_filter: str | None = None, model_filter: str | None = 
     for task in tasks:
         if task_filter and task["id"] != task_filter:
             continue
+        if not task_filter and not task.get("enabled", True):
+            continue
+        task_conditions = ([condition_filter] if condition_filter else task.get("conditions", chosen_conditions))
+        if any(condition not in conditions for condition in task_conditions):
+            raise ValueError(f"Task {task['id']} refers to unconfigured conditions")
         for label in chosen_workers:
             model = workers[label]
-            for condition in chosen_conditions:
+            for condition in task_conditions:
                 for trial in range(1, repeats_final + 1):
                     matrix.append((task, label, model, condition, trial))
     return matrix
@@ -1138,14 +1136,14 @@ def main() -> int:
                         help="Required for plan/run when native skills are selected; "
                         "path to xskills/skills (never configured in TOML)")
     parser.add_argument("--xtc-env", type=Path, metavar="SCRIPT",
-                        help="Required for no_skills_xtc: macOS SetEnv.sh or Linux SetEnv "
-                             "activation script; only that condition inherits XTC")
+                        help="Required for warm conditions and implementation verification: "
+                             "macOS SetEnv.sh or Linux SetEnv activation script")
     parser.add_argument("--task", help="Optional task ID filter")
     parser.add_argument("--model", help="Filter by worker alias (luna) or full OpenCode model ID")
-    parser.add_argument("--condition", help="Filter by condition (native, no_skills, no_skills_xtc, later mcp)")
+    parser.add_argument("--condition", help="Filter by condition (native_xtc, no_skills_xtc, native, no_skills)")
     parser.add_argument("--repeats", type=int, help="Override repeats per model/condition")
-    parser.add_argument("--smoke", action="store_true", help="Quick complete comparison: one task, two configured workers, "
-                        "across native/no_skills/no_skills_xtc, one repeat, optional verifier and blind reviewer")
+    parser.add_argument("--smoke", action="store_true", help="One task, two workers, declared task conditions, "
+                        "one repeat and blind review (four runs for implementation-v2)")
     parser.add_argument("--results", type=Path, help="Existing experiment directory for 'report'")
     parser.add_argument("--results-root", type=Path, default=BASE / "bench-results",
                         help="Persistent experiment archive directory (default: bench-results)")
@@ -1153,17 +1151,12 @@ def main() -> int:
                         help="SQLite historical index path (default: RESULTS_ROOT/gladiators.sqlite3)")
     parser.add_argument("--limit", type=int, default=40, help="Number of rows shown in history/trend")
     parser.add_argument("--no-review", action="store_true")
-    parser.add_argument("--allow-unverified", action="store_true", help="Legacy compatibility flag; verification is now optional by default")
-    parser.add_argument("--require-verification", action="store_true",
-                        help="Fail before model calls if any selected task lacks an independent verifier")
     parser.add_argument("--progress-every", type=float, default=None,
                         metavar="SECONDS", help="Show activity during workers, verification and review "
                         "every N seconds (0 disables periodic updates; default from benchmark.toml)")
     args = parser.parse_args()
     if args.smoke and args.no_review:
         parser.error("--smoke includes the independent reviewer; omit --smoke to use --no-review")
-    if args.require_verification and args.allow_unverified:
-        parser.error("--require-verification conflicts with --allow-unverified")
     if args.limit < 1:
         parser.error("--limit must be positive")
     results_root = args.results_root.resolve()
@@ -1208,9 +1201,7 @@ def main() -> int:
     preflight_inputs(matrix, config_path)
     if args.command == "plan":
         if args.smoke:
-            print("SMOKE PLAN (six worker trials, optional verification, and blind referee)")
-            if any(not task.get("verify_commands") for task, *_ in matrix):
-                print("NOTE: no verifier configured; trial correctness will be UNVERIFIED, but review still runs.")
+            print(f"SMOKE PLAN ({len(matrix)} worker trials and blind referee)")
         for t, name, model, condition, trial in matrix:
             print(f"{t['id']:26} {name:8} {model:42} {condition:12} r{trial}")
         print(f"\n{len(matrix)} independent worker runs. Reviewer: "
@@ -1221,16 +1212,6 @@ def main() -> int:
                          float(exp.get("progress_interval_seconds", 20)))
     if progress_interval < 0:
         parser.error("--progress-every must be nonnegative")
-    unconfigured = sorted({t["id"] for t, *_ in matrix if not t.get("verify_commands")})
-    if args.require_verification and unconfigured:
-        raise ValueError("Independent verification required for: " + ", ".join(unconfigured) +
-                         ". Configure tasks[].verify_commands or omit --require-verification. "
-                         "No model calls were started.")
-    allow_unverified = not args.require_verification
-    if unconfigured:
-        print("WARNING: No independent verifier configured for " + ", ".join(unconfigured) +
-              ". Correctness will be UNVERIFIED (not passed); the blind reviewer "
-              "can still assess design quality.", flush=True)
     # Verify cold/warm conditions and the XTC shell script BEFORE making model calls
     # or writing an experiment directory. Source the script only for warm workers.
     base_env = config_environment(conf, config_path)
@@ -1239,6 +1220,9 @@ def main() -> int:
         base_env, xtc_script,
         needs_xsim=any(t.get("kind") == "sim" for t, *rest in matrix)
     ) if xtc_script else None
+    if any(t.get("verifier") for t, *_ in matrix):
+        from verification.uart_heartbeat import validate_toolchain
+        validate_toolchain(xtc_env)
     exe = exp.get("opencode_command", "opencode")
     if not Path(exe).is_file() and shutil.which(exe) is None:
         raise ValueError(f"OpenCode executable not found: {exe}")
@@ -1247,7 +1231,7 @@ def main() -> int:
     root = (results_root / (dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6])).resolve()
     root.mkdir(parents=True)
     run_options = {"smoke": args.smoke, "review_enabled": reviewer_enabled,
-                   "allow_unverified": allow_unverified,
+                    "verification_required": True,
                    "native_skills_directory_supplied": skills_dir is not None,
                    "xtc_activation_supplied": xtc_env is not None,
                    "model_filter": args.model, "condition_filter": args.condition,
@@ -1280,9 +1264,9 @@ def main() -> int:
         print(f"Results: {root}", flush=True)
         print(f"Results database: {db_path}", flush=True)
         if args.smoke:
-            print("SMOKE MODE: one problem; two worker models x three conditions; "
+            print(f"SMOKE MODE: one problem; two worker models x {len({r[3] for r in matrix})} conditions; "
                   "one repeat; independent blind reviewer ENABLED. "
-                  "Independent verification optional; unconfigured tasks remain UNVERIFIED. "
+                   "Uniform independent verification REQUIRED. "
                   "Real Copilot usage, including referee, may incur charges.", flush=True)
         print(f"Gladiators: {len(matrix)} worker runs; {len({t[0]['id'] for t in matrix})} task(s); "
               f"referee {'enabled' if reviewer_enabled else 'disabled'}; "
@@ -1297,8 +1281,7 @@ def main() -> int:
             result = run_one(conf, config_path, root, task, label, model, cond, trial,
                              skills_dir=skills_dir, xtc_env=xtc_env,
                              progress=lambda message: print(message, flush=True),
-                             progress_interval=progress_interval,
-                             require_verifier_output=bool(args.smoke and task.get("verify_commands")))
+                             progress_interval=progress_interval)
             all_results.append(result)
             index_experiment(db, root)  # Keep partial results queryable if interrupted.
             if result.get("error"):

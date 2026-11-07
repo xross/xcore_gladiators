@@ -1,165 +1,89 @@
-# Gladiators: the referee's report
+# Report format and interpretation
 
-**Are you not entertained?** (film *Gladiator*). The final RST scoreboard
-is an evidence-based comparison, not a popularity contest.
+`REPORT.rst` is a management-facing result summary. It is rendered using
+reStructuredText list tables, with narrow rank/score columns and more space for
+conditions and explanatory text. The generator uses no model calls.
 
-*"Gladiators, you will go on my second whistle."* (John Anderson, British TV
-show *Gladiators*). This is the cue for the independent implementers to start;
-the separate referee reviews their anonymous solutions only after the trials
-and trusted verification are complete. It cannot see their model identities
-or skills conditions when scoring.
+## Main report
 
-The benchmark uses a handful of Gladiators event names to label measurable
-stages: **The Wall** (trusted verification), **Duel** (paired condition
-comparison), **Hang Tough** (repeatability), and **The Eliminator / Travelator**
-(time to a verified finish). A worker that fails verification has not finished
-the Travelator, regardless of elapsed time. Event names are never included
-in worker prompts, and they do not change objective pass/fail criteria.
+1. **Executive summary:** independent pass/fail/error counts, highest blind
+   design rank, fastest and lowest-usage independently passing submissions.
+2. **Results at a glance:** ordered by blind rank, with model/condition, worker
+   language, time, estimated credits and independent result. Unranked entries follow.
+   The matrix size and repeats are explicit; report regeneration does not invent
+   missing conditions or additional trials.
+3. **Language choices and skill consultation:** C/XC percentages within each
+   condition, with no combined overall row. Count all submissions, including
+   failures, not lines of code. Classify firmware under the archived `source/src`
+   tree; exclude host tests and installed libraries. Mixed languages and missing
+   source are separate categories rather than double-counted or silently omitted.
+   Flag enabled skills with no recorded consultation, while keeping unavailable
+   telemetry distinct from zero usage. Successful skill loads and explicit file
+   reads count; mere availability or a failed load does not. Show paired language
+   changes alongside independent outcomes. Recorded prescriptive C guidance can
+   be quoted, but is not proof that language or skills caused a failure.
+4. **Did skills help?** Matched pass outcomes, elapsed-time and usage differences,
+   and blind preferences. Repeated matched trials use medians, never selected
+   best attempts or pooled unrelated tasks.
+5. **Blind design ranking:** concise ranking reasons with readable model and
+   condition labels, not the first sentence's repeated verifier counts. Select
+   reasons from the saved reviewer summary; preserve the complete review in the
+   appendix and leave the original ranking unchanged. Candidate tests are not scored.
+6. **Limits/next steps:** finite simulation, single-trial uncertainty, estimated
+   billing, isolation/model-provenance caveats and repeated-trial recommendations.
 
-The benchmark writes `bench-results/<run-id>/REPORT.rst` as **reStructuredText (RST)**. The final report is a
-**management-facing result summary**, not a full replication protocol. It should be understandable
-to somebody who did not run OpenCode or read the worker transcripts. It uses proper RST headings, `list-table` directives and literal code blocks, so it can be rendered with Docutils or Sphinx (including in XMOS documentation workflows). No Markdown conversion step is needed.
+No separate toolchain-activation analysis is needed: both primary conditions
+receive XTC so workers can attempt the implementation. No film quotation is
+included. Raw run IDs and anonymous labels do not dominate headings.
 
-The runner has no rendering dependency. To preview the report as HTML, install Docutils separately and run `rst2html REPORT.rst REPORT.html`, or include the RST in a Sphinx documentation build. Markdown is retained only for the developer README and methodology documentation.
+## Strict correctness evidence
 
-## Report versus methodology documentation
+Every configured task must have a supported harness-owned verifier. Every
+completed submission must have an explicit independent pass/fail receipt with
+protocol ID, verifier fingerprint and measurements. Passing receipts require
+the fresh build and fixed-window simulator evidence. Missing, malformed or
+contradictory receipts are errors, never successful/unchecked results.
 
-`REPORT.rst` puts executive findings, the scoreboard, paired comparisons and the
-referee's summary **first**. It gives management a concise methodology summary,
-then an appendix with detailed evidence and reproducibility records:
+The report rejects unchecked archives and mixed implementation/testing rankings.
+It does not reconstruct correctness from worker event logs, self-reported tests,
+DESIGN.md, test counts, simulation lengths or reviewer opinions. Different
+verifier fingerprints cannot be compared as one task's acceptance results.
 
-1. Aim, selected problems and one-line rationales.
-2. High-level experiment design: OpenCode via GitHub Copilot, models, conditions,
-   independent runs, verifier, blind reviewer and the main limitations.
-3. Short profiles for each worker and the reviewer (model, developer, Copilot
-   access route and published tier); expected strengths and rationale are in the appendix.
-4. Verified outcomes, design verdicts, run-by-run token/time/cost measurements,
-   actual skills observed, verified resources, paired comparisons and the
-   proposed follow-up with MCP-delivered skills.
-5. Reproducibility pointers to the protocol and frozen experiment metadata.
+Execution errors remain visible and mark the matrix incomplete. Failed
+submissions cannot win speed/cost recommendations. Worker wall time, verifier
+duration and worker-plus-verifier finish time are distinct metrics.
 
-**Do not paste the full protocol into every report.** The canonical, detailed
-method is in `docs/EXPERIMENT_DESIGN.md`: test hypotheses, selection of tasks,
-prompt-specificity controls, run ordering, isolation, skill conditions,
-verification, blind judging, metric definitions, statistical limitations and
-the later native-vs-MCP comparison. This document (`docs/REPORTING.md`)
-records output requirements, model-provenance rules, pricing-accounting
-interpretation and how report regeneration preserves provenance.
+## Appendix
 
-The run-specific frozen configuration and ordered trials live in
-`bench-results/<run-id>/experiment.json`. Worker transcripts, original prompts,
-verifier outputs and raw JSON evidence live in the same results tree. Those
-artifacts—not the README—are the source of run-specific results. Report
-regeneration reads the frozen metadata rather than silently substituting edits
-made to `benchmark.toml` after the run.
+The appendix contains a short identifier key for log lookup, frozen methodology,
+full IDs, token telemetry, skill retrievals, model profiles/provenance, exact
+times/costs, independent resource/waveform measurements, reviewer reasoning,
+rating tables and separate decision/risk bullets. Ratings are not JSON strings.
 
-### Minimum methodological points shown in REPORT.rst
+Independent core/RAM counts come from the compiler report, not source-level
+function counts. Physical timing/flash use remains unknown unless measured.
+Credits and USD are estimates; missing telemetry must remain unknown and model
+reasoning tokens must not be billed twice.
 
-- Access/provider: Python -> OpenCode CLI -> GitHub Copilot, not a direct model
-  developer API; separate worker and reviewer sessions.
-- Conditions: the same task in no-skills/native-skills conditions (and MCP later),
-  identical prompt/starter within a task, condition-specific skill availability.
-- Independent validation and blind review: verification determines correctness;
-  reviewer assesses design without seeing models/conditions.
-- Limits: fixed/non-randomised run order, current directory-level rather than
-  OS-level isolation, single trials exploratory, estimates not actual billing.
+## Provenance and regeneration
 
-The full documentation must be updated whenever the experiment's methodology
-changes. The report should remain concise and readable without assuming that
-management will open the documentation.
-
-## Model size and quality: do not invent precision
-
-GitHub Copilot publishes labels such as **Powerful** and **Lightweight** and
-recommends models for different task types. Those are provider descriptions of
-intended use and tier, **not published parameter counts, measured performance
-on xcore tasks, or an objective ranking**. The initial proprietary models'
-parameter counts are not publicly disclosed. Likewise, the effective context
-window through a particular OpenCode/Copilot adapter must be verified on the
-actual deployed client; do not infer it from a Copilot pricing threshold.
-
-`benchmark.toml` contains the editable `[model_profiles."<model-id>"]`
-entries. For a new model, supply at least:
-
-```toml
-[model_profiles."github-copilot/new-model-id"]
-display_name = "New model"
-developer = "Model developer (check the provider documentation)"
-published_category = "Powerful / Lightweight / etc. (only if documented)"
-parameter_count = "Not publicly disclosed"
-context_window = "Not verified for OpenCode via GitHub Copilot"
-quality_expectation = "What you expect this model to be good at — hypothesis only"
-selection_rationale = "Why the experiment needs this model"
-source = "https://official-source.example/"
-source_checked = "YYYY-MM-DD"
-```
-
-**Changing a model ID does not automatically update its profile.** If a
-profile is missing, the report explicitly marks fields as unknown rather than
-assigning a developer or capability. Check `opencode models` before paid runs.
-
-Default-model profile sources, checked 2026-11-06:
-
-- [GitHub: supported models and developers](https://docs.github.com/en/copilot/reference/ai-models/supported-models)
-- [GitHub: model comparisons and intended uses](https://docs.github.com/en/copilot/reference/ai-models/model-comparison)
-- [GitHub: Copilot token-rate table](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)
-
-## A report stays faithful after configuration changes
-
-At run creation, the runner stores a **sanitised report configuration** inside
-`experiment.json`, along with a SHA-256 digest of the actual TOML file and a
-full, ordered trial manifest. It records the task rationales, worker IDs,
-reviewer ID, model profiles, prices and skill-condition types. It deliberately
-**does not** copy authentication credentials, local home/profile paths, MCP
-URLs or secrets into this snapshot.
-
-The command below uses that snapshot rather than the current edited TOML when
-regenerating reports:
+Reports use `experiment.json`'s frozen settings, not later edits to TOML.
+Protocol constants, verifier SHA-256, XTC version and skill revision are recorded.
+Do not pool different prompts, verifier revisions or conditions. Provider tiers
+and expected strengths are descriptions, not measured model quality or known
+parameter counts. An unavailable served-model identity stays explicitly unknown.
 
 ```sh
 python3 benchmark.py report --results bench-results/<run-id>
 ```
 
-Older result directories without a report snapshot can still be rendered, but
-then metadata may come from the current TOML file; treat those reports as less
-reproducible. Task text is also captured in the per-trial worker prompts, which
-can be audited separately without trusting any summarised description.
+The command regenerates presentation only, never evidence or rankings. Only
+strictly verified experiments are supported. Historical unchecked files are
+neither converted nor deleted. External Docutils/Sphinx/rst2pdf may render the
+RST; they are not dependencies of the benchmark runner.
 
-## Reviewer versus model-quality claim
+## Future framework-authoring skills
 
-The separate high-capability reviewer scores **implementations** on software
-quality, not the generic quality of an LLM. Objective correctness comes from
-independent build/simulator/hardware checks. Blind review prevents the
-reviewer seeing worker identity and skills condition until results are mapped
-back into the final report. It does not eliminate subjective scoring bias.
-
-Do not claim that a model is "better" because its published tier is Powerful,
-or that skills are effective because they were loaded. Compare verified paired
-outcomes and publish uncertainty, then collect repeated trials.
-
-## Repeated experiments and quick pilot
-
-`--smoke` runs two configured worker models under all three conditions
-(no skills, native skills, and no skills with XTC preactivated),
-then invokes the blind reviewer, even without a verifier. Such trials are
-reported as `unverified`, not passes. When `verify_commands` are configured,
-they run for each candidate and must produce `benchmark-verification.json` with
-an explicit boolean `passed`; missing output is a failed validation.
-Use `--require-verification` for a strict preflight gate.
-Smoke mode uses one repeat and remains exploratory. The six worker runs plus referee incur actual GitHub
-Copilot usage when running against live models.
-
-Reports live in unique, immutable experiment directories; the SQLite
-`bench-results/gladiators.sqlite3` index permits cross-run trend/comparison
-queries and is rebuildable using `benchmark.py index`. Never compare results
-from different task/prompt revisions as if they were paired trials.
-
-## XTC activation comparison
-
-Include all three conditions (`no_skills`, `native`, `no_skills_xtc`) in the
-scoreboard. Include a separate environment-control table comparing `no_skills`
-with `no_skills_xtc`, and describe which runs were preactivated. This identifies
-whether the first hurdle was toolchain availability rather than code quality.
-Do not report that toolchain setup alone improves correctness unless the
-independent verifier confirms it. The appendix records the activated XTC
-version and fingerprint of the activation script, not local user paths.
+Evaluate simulation-framework generation in a distinct task class using
+known-good and faulty implementations, fault detection, false failures and
+runner reliability. Do not mix those scores into xcore implementation ranking.

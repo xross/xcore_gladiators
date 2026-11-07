@@ -6,9 +6,11 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import benchmark as b
+from fixtures.fake_verifier import observations, validation
 
 
 class BenchmarkTests(unittest.TestCase):
@@ -18,9 +20,10 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_matrix_and_distinct_reviewer(self):
         matrix = b.plan(self.conf)
-        self.assertEqual(27, len(matrix))
-        self.assertEqual(3, len(self.conf["tasks"]))
-        self.assertEqual({"specific", "everyday", "vague"},
+        self.assertEqual(6, len(matrix))
+        self.assertEqual({"uart-heartbeat-specific"}, {row[0]["id"] for row in matrix})
+        self.assertEqual(1, len(self.conf["tasks"]))
+        self.assertEqual({"specific"},
                          {t["specificity"] for t in self.conf["tasks"]})
         self.assertNotIn(self.conf["models"]["reviewer"], self.conf["models"]["workers"].values())
         self.conf["models"]["reviewer"] = self.conf["models"]["workers"]["sol"]
@@ -39,19 +42,22 @@ class BenchmarkTests(unittest.TestCase):
             for forbidden in ("xcommon", "lib_xcore", "Pyxsim", "CMake", "hardware thread", "XC main"):
                 self.assertNotIn(forbidden.lower(), user_text.lower())
         self.assertIn("115200", prompts["specific"])
-        self.assertIn("115200", prompts["everyday"])
-        self.assertNotIn("115200", prompts["vague"])
-        self.assertLess(len(prompts["vague"]), len(prompts["specific"]))
+        self.assertIn("25 ms", prompts["specific"])
+        self.assertIn("benchmark_check.py", prompts["specific"])
 
-    def test_each_variant_has_nine_worker_conditions(self):
+    def test_only_independently_verified_task_is_configured(self):
         from collections import Counter
         matrix = b.plan(self.conf)
-        self.assertEqual({t["id"]: 9 for t in self.conf["tasks"]},
-                         dict(Counter(t["id"] for t, *_ in matrix)))
+        self.assertEqual({"uart-heartbeat-specific": 6},
+                          dict(Counter(t["id"] for t, *_ in matrix)))
+        with self.assertRaisesRegex(ValueError, "Unknown task"):
+            b.plan(self.conf, task_filter="uart-heartbeat-vague")
+        task_dir = Path(b.__file__).parent / "tasks" / "uart-heartbeat"
+        self.assertEqual({"prompt-implementation-v2.md"}, {p.name for p in task_dir.glob("prompt*.md")})
 
     def test_warm_control_has_no_skills_but_uses_separate_environment(self):
         matrix = b.plan(self.conf, task_filter="uart-heartbeat-specific")
-        self.assertEqual({"no_skills", "native", "no_skills_xtc"}, {m[3] for m in matrix})
+        self.assertEqual({"native_xtc", "no_skills_xtc"}, {m[3] for m in matrix})
         with tempfile.TemporaryDirectory() as td:
             workspace = Path(td) / "worker"
             config, _ = b.prepare_project(workspace, self.conf["tasks"][0], self.config_path,
@@ -135,16 +141,18 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual(data["cwd"], data["PWD"])
             self.assertEqual(str(root), env["PWD"], "Caller environment must remain unchanged")
 
-    def test_verifier_prints_progress_for_slow_commands(self):
+    def test_verifier_progress_and_required_evidence(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             messages = []
-            task = {"verify_commands": [f'{sys.executable} -c "import time;time.sleep(0.22)"']}
-            result = b.verify_candidate(task, root, os.environ.copy(), root, 20,
-                                        progress=messages.append, progress_interval=0.05)
+            def check(workspace, output, env, timeout, progress):
+                progress("fresh build and fixed simulation")
+                return observations()
+            with patch("verification.uart_heartbeat.verify", side_effect=check):
+                result = b.verify_candidate(self.conf["tasks"][0], root, os.environ.copy(), root, 20,
+                                            progress=messages.append)
             self.assertEqual("passed", result["status"])
-            self.assertTrue(any("still running" in m for m in messages), messages)
-            self.assertTrue(any("exit=0" in m for m in messages), messages)
+            self.assertIn("fresh build and fixed simulation", messages)
 
     def test_mcp_condition_uses_v2_mcp_servers_config(self):
         with tempfile.TemporaryDirectory() as td:
@@ -182,24 +190,24 @@ class BenchmarkTests(unittest.TestCase):
             self.assertFalse((dst / "opencode.json").exists())
             self.assertFalse((dst / ".opencode").exists())
 
-    def test_verifier_overwrites_worker_forged_results(self):
+    def test_verifier_ignores_worker_forged_results(self):
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
-            # A worker's claimed "pass" must be deleted before trusted validator.
+            # A worker's claimed pass cannot replace the independent receipt.
             (d / "benchmark-verification.json").write_text('{"passed":true,"metrics":{"threads_per_tile":{"0":1}}}', encoding="utf-8")
             out = d / "result"
             out.mkdir()
-            task = {"verify_commands": ["python3 -c 'import sys;sys.exit(1)'"]}
-            res = b.verify_candidate(task, d, {}, out, 10)
+            with patch("verification.uart_heartbeat.verify", return_value=observations(False)):
+                res = b.verify_candidate(self.conf["tasks"][0], d, {}, out, 10)
             self.assertEqual("failed", res["status"])
-            self.assertNotIn("observations", res)
-            self.assertFalse((d / "benchmark-verification.json").exists())
+            self.assertFalse(res["observations"]["passed"])
+            self.assertTrue((d / "benchmark-verification.json").exists())
 
     def test_unconfigured_verifier_is_never_pass(self):
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
-            res = b.verify_candidate({"verify_commands": []}, d, {}, d, 10)
-            self.assertEqual("unverified", res["status"])
+            with self.assertRaisesRegex(ValueError, "requires a supported independent"):
+                b.verify_candidate({}, d, {}, d, 10)
 
 
     def test_report_includes_brief_methodology_and_frozen_model_profiles(self):
@@ -214,7 +222,7 @@ class BenchmarkTests(unittest.TestCase):
             })
             row = {"run_id": "example", "task_id": task["id"], "model_label": "sol",
                    "model": "github-copilot/gpt-6.1-sol", "condition": "no_skills", "repeat": 1,
-                   "validation": {"status": "unverified"}, "usage": {}, "skill_calls": []}
+                   "validation": validation(), "usage": {}, "skill_calls": []}
             # Simulate config changes AFTER the run; report must retain frozen IDs.
             changed = b.load_config(self.config_path)
             changed["models"]["reviewer"] = "github-copilot/different-future-model"
@@ -223,12 +231,12 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual("REPORT.rst", report.name)
             rst = report.read_text(encoding="utf-8")
             self.assertIn("Gladiators - AI Coding-Agent Benchmark", rst)
-            self.assertIn("Are you not entertained?", rst)
+            self.assertNotIn("Are you not entertained?", rst)
             self.assertIn("Gladiators, you will go on my second whistle.", rst)
             self.assertIn("Results at a glance", rst)
             self.assertIn("Did skills help?", rst)
             self.assertIn("Travelator - independently verified finish times", rst)
-            self.assertIn("No independently verified paired comparison", rst)
+            self.assertIn("No complete matched pass/fail pair", rst)
             self.assertIn("GitHub Copilot", rst)
             self.assertIn(".. list-table::", rst)
             self.assertIn("Independent verifier observations", rst)
@@ -272,18 +280,18 @@ class BenchmarkTests(unittest.TestCase):
             conf['experiment']['opencode_command'] = str(fake)
             conf['experiment']['clean_home'] = ''
             task = dict(conf['tasks'][0])
-            task["verify_commands"] = [f"{sys.executable} {Path(__file__).resolve().parent / 'fixtures' / 'fake_verifier.py'}"]
             results = []
-            for cond in ('no_skills', 'native'):
-                result = b.run_one(conf, self.config_path, root, task, 'sol', 'github-copilot/gpt-6.1-sol',
-                                   cond, 1, skills_dir=root / 'skills')
+            for cond in ('no_skills_xtc', 'native_xtc'):
+                with patch("verification.uart_heartbeat.verify", side_effect=lambda *args, **kwargs: observations()):
+                    result = b.run_one(conf, self.config_path, root, task, 'sol', 'github-copilot/gpt-6.1-sol',
+                                       cond, 1, skills_dir=root / 'skills', xtc_env=os.environ.copy())
                 results.append(result)
                 self.assertNotIn('error', result, result.get('error'))
                 self.assertTrue(result['session_exported'])
                 self.assertEqual('passed', result['validation']['status'])
                 self.assertEqual(2, result['validation']['observations']['metrics']['threads_per_tile']['0'])
                 self.assertGreater(result['usage']['copilot_estimated_usd'], 0)
-                self.assertEqual(bool(result['skill_calls']), cond == 'native')
+                self.assertEqual(bool(result['skill_calls']), cond == 'native_xtc')
             review = b.judge_task(conf, self.config_path, root, task, results)
             self.assertEqual('reviewed', review['status'])
             self.assertEqual(2, len(review['blind_mapping']))
@@ -291,6 +299,9 @@ class BenchmarkTests(unittest.TestCase):
             for candidate in judge_dir.iterdir():
                 self.assertFalse((candidate / 'source' / 'opencode.json').exists())
                 self.assertFalse((candidate / 'source' / '.opencode').exists())
+                self.assertFalse((candidate / 'source' / 'tests').exists())
+                self.assertTrue((candidate / 'source' / 'src' / 'main.c').exists())
+            self.assertNotIn("testing_quality", (judge_dir.parent / "REVIEW_INSTRUCTIONS.md").read_text())
 
 
 if __name__ == "__main__":

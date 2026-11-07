@@ -5,7 +5,7 @@
 name = "Gladiators - XMOS coding-agent benchmark"
 seed = 20261106
 repeats = 1                 # increase to >= 3 for meaningful comparisons
-smoke_models = ["luna", "sol"]  # --smoke runs these two workers, each in three conditions, plus referee
+smoke_models = ["luna", "sol"]  # --smoke: two workers x two warm implementation conditions, plus referee
 parallel_sim_runs = 1       # 1 preferred for fair wall-time and CPU comparisons
 worker_timeout_seconds = 2700
 reviewer_timeout_seconds = 1200
@@ -29,7 +29,7 @@ reviewer = "github-copilot/gpt-6-astra"
 
 [models.workers]
 sol = "github-copilot/gpt-6.1-sol"
-opus = "github-copilot/claude-opus-5-5"
+opus = "github-copilot/claude-opus-5.5"
 luna = "github-copilot/gpt-6-luna"
 
 # Report-only model catalogue. These descriptions are recorded BEFORE testing:
@@ -48,7 +48,7 @@ selection_rationale = "Representative high-capability OpenAI worker for complex 
 source = "https://docs.github.com/en/copilot/reference/ai-models/model-comparison"
 source_checked = "2026-11-06"
 
-[model_profiles."github-copilot/claude-opus-5-5"]
+[model_profiles."github-copilot/claude-opus-5.5"]
 display_name = "Claude Opus 5.5"
 developer = "Anthropic"
 published_category = "Powerful"
@@ -81,10 +81,8 @@ selection_rationale = "Independent, high-capability reviewer using a different e
 source = "https://docs.github.com/en/copilot/reference/ai-models/model-comparison"
 source_checked = "2026-11-06"
 
-[conditions.no_skills]
-type = "none"
-
-[conditions.native]
+# Primary implementation comparison: both workers start with XTC ready.
+[conditions.native_xtc]
 type = "native"
 
 # Toolchain preconfigured but NO local/native skills: separates installation
@@ -107,7 +105,7 @@ cache_read = 0.10
 cache_write = 2.5
 output = 10.0
 
-[pricing."github-copilot/claude-opus-5-5"]
+[pricing."github-copilot/claude-opus-5.5"]
 input = 4.0
 cache_read = 0.20
 cache_write = 5.0
@@ -125,41 +123,17 @@ cache_read = 1.0
 cache_write = 12.5
 output = 50.0
 
-# One underlying engineering problem at three levels of user prompt detail.
-# A verifier is optional, including for --smoke. If no verifier is configured,
-# candidate correctness is explicitly UNVERIFIED. If configured, trusted verifier
-# commands must produce benchmark-verification.json with passed and evidence.
-# See tasks/uart-heartbeat/VERIFIER.md and docs/QUICKSTART.md.
-# Use --task uart-heartbeat-specific for the initial six-run pilot.
-# If --task is omitted, all three prompts run (27 worker trials at repeats=1).
-# DO NOT apply numerical requirements from the specific variant to a vaguer one.
+# Every task must name a supported independent verifier. No unverified runs.
 
 [[tasks]]
 id = "uart-heartbeat-specific"
+revision = "implementation-v2"
+evaluation_class = "implementation"
+verifier = "uart-heartbeat-implementation-v2"
+conditions = ["no_skills_xtc", "native_xtc"]
 family = "uart-heartbeat"
 specificity = "specific"
 kind = "sim"
 rationale = "Specified UART framing, waveform and concurrency requirements; tests hardware timing choices and correctness without prescribing XMOS implementation details."
-prompt = "tasks/uart-heartbeat/prompt.md"
+prompt = "tasks/uart-heartbeat/prompt-implementation-v2.md"
 starter = "tasks/uart-heartbeat/starter"
-verify_commands = []
-
-[[tasks]]
-id = "uart-heartbeat-everyday"
-family = "uart-heartbeat"
-specificity = "everyday"
-kind = "sim"
-rationale = "Typical short customer prompt: target data rate and heartbeat frequency but no language, library, framing or architecture prescriptions. Tests reasonable defaults and verification."
-prompt = "tasks/uart-heartbeat/prompt-everyday.md"
-starter = "tasks/uart-heartbeat/starter"
-verify_commands = []
-
-[[tasks]]
-id = "uart-heartbeat-vague"
-family = "uart-heartbeat"
-specificity = "vague"
-kind = "sim"
-rationale = "Minimal customer intent with no explicit baud, framing or heartbeat frequency. Tests whether agents choose sensible assumptions and produce demonstrably concurrent outputs; grading must not impose unstated numbers."
-prompt = "tasks/uart-heartbeat/prompt-vague.md"
-starter = "tasks/uart-heartbeat/starter"
-verify_commands = []

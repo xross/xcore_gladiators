@@ -119,6 +119,14 @@ def index_experiment(db: sqlite3.Connection, result_dir: Path) -> tuple[int, int
               len(manifest.get("run_order") or []), dt.datetime.now(dt.timezone.utc).isoformat()))
         for file in sorted((root / "runs").glob("*/result.json")):
             trial = _json(file)
+            validation = trial.get("validation") or {}
+            if validation.get("status") != "error":
+                from verification.uart_heartbeat import validate_observations
+                if validation.get("status") not in ("passed", "failed"):
+                    raise ValueError("Only independently checked results or execution errors can be indexed")
+                validate_observations(validation.get("observations"))
+                if validation["observations"]["passed"] != (validation["status"] == "passed"):
+                    raise ValueError("Verification status contradicts its independent evidence")
             usage = trial.get("usage") or {}
             tokens = usage.get("tokens") or {}
             invocation = trial.get("invocation") or {}
@@ -196,7 +204,9 @@ def history(db: sqlite3.Connection, limit: int = 20) -> list[str]:
               WHERE v.experiment_id=e.experiment_id) as referee_usd,
              e.report_path
       FROM experiments e LEFT JOIN trials t ON e.experiment_id=t.experiment_id
-      GROUP BY e.experiment_id ORDER BY e.started_utc DESC, e.experiment_id DESC LIMIT ?
+        AND t.verification_status IN ('passed','failed','error')
+      GROUP BY e.experiment_id HAVING COUNT(t.run_id)>0 OR e.report_path IS NULL
+      ORDER BY e.started_utc DESC, e.experiment_id DESC LIMIT ?
     """
     rows = db.execute(query, (limit,)).fetchall()
     if not rows:
@@ -214,7 +224,7 @@ def history(db: sqlite3.Connection, limit: int = 20) -> list[str]:
 def trend(db: sqlite3.Connection, task: str | None = None, model: str | None = None,
           condition: str | None = None, limit: int = 40) -> list[str]:
     """Time-ordered individual trials; prompt hash prevents accidental comparisons."""
-    filters, args = [], []
+    filters, args = ["t.verification_status IN ('passed','failed','error')"], []
     if task:
         filters.append("t.task_id = ?")
         args.append(task)
@@ -246,7 +256,7 @@ def trend(db: sqlite3.Connection, task: str | None = None, model: str | None = N
 
 def compare(db: sqlite3.Connection, task: str | None = None, model: str | None = None,
             condition: str | None = None) -> list[str]:
-    filters, args = [], []
+    filters, args = ["t.verification_status IN ('passed','failed','error')"], []
     if task:
         filters.append("t.task_id = ?")
         args.append(task)
@@ -260,7 +270,7 @@ def compare(db: sqlite3.Connection, task: str | None = None, model: str | None =
     rows = db.execute(f"""
       SELECT t.task_id,t.model_id,t.condition,t.prompt_sha256,
              COUNT(*) as n, SUM(t.verification_status='passed') as passes,
-             SUM(t.verification_status='unverified') as unverified,
+              SUM(t.verification_status IN ('passed','failed')) as checked,
              ROUND(AVG(t.worker_seconds),1) as avg_worker_s,
              ROUND(AVG(t.estimated_usd),4) as avg_usd,
              MIN(e.started_utc) as first_run,MAX(e.started_utc) as last_run
@@ -270,15 +280,14 @@ def compare(db: sqlite3.Connection, task: str | None = None, model: str | None =
     """, tuple(args)).fetchall()
     if not rows:
         return ["No comparable trials indexed."]
-    out = ["Task                     Model                        Condition    N   Pass/verified  Avg(s) Est.USD Prompt hash First..last"]
+    out = ["Task                     Model                        Condition    N   Pass/checked   Avg(s) Est.USD Prompt hash First..last"]
     for r in rows:
-        verified = r["n"]-r["unverified"] if r["unverified"] is not None else r["n"]
         out.append(f"{r['task_id'][:24]:24} {r['model_id'][:28]:28} "
                    f"{r['condition'][:12]:12} {r['n']:3} "
-                   f"{r['passes'] or 0:3}/{verified:<8} "
+                   f"{r['passes'] or 0:3}/{r['checked'] or 0:<8} "
                    f"{_fmt(r['avg_worker_s'],1):>6} {_fmt(r['avg_usd'],4):>7} "
                    f"{(r['prompt_sha256'] or 'n/a')[:11]:11} "
                    f"{(r['first_run'] or '')[:10]}..{(r['last_run'] or '')[:10]}")
-    out.append("Unverified, failed and errored trials must not be counted as passing. "
+    out.append("Failed and errored trials must not be counted as passing. "
                "Prompt hashes identify task wording; review verifier revisions before trend claims.")
     return out

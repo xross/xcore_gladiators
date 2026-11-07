@@ -46,6 +46,9 @@ class Rst:
     def subsection(self, title: str) -> None:
         self.lines += [title, "~" * len(title), ""]
 
+    def detail(self, title: str) -> None:
+        self.lines += [title, "^" * len(title), ""]
+
     def para(self, text: str) -> None:
         self.lines += [text.strip(), ""]
 
@@ -54,8 +57,14 @@ class Rst:
             self.lines.append("- " + item.strip())
         self.lines.append("")
 
-    def table(self, headers: list[str], rows: list[list[object]]) -> None:
-        self.lines += [".. list-table::", "   :header-rows: 1", "   :widths: auto", ""]
+    def table(self, headers: list[str], rows: list[list[object]], widths: list[int] | None = None) -> None:
+        if widths is None:
+            narrow = {"Rank", "Trial", "Trials", "Passes", "Est. credits", "Est. USD", "Rating (0-5)"}
+            wide = {"Reviewer's takeaway", "Warnings", "Reason chosen", "Skills loaded", "Execution evidence"}
+            widths = [6 if h in narrow else 35 if h in wide else 18 for h in headers]
+        if len(widths) != len(headers) or any(w <= 0 for w in widths):
+            raise ValueError("Invalid RST column widths")
+        self.lines += [".. list-table::", "   :header-rows: 1", "   :widths: " + " ".join(map(str, widths)), ""]
         if not rows:
             rows = [["n/a"] + ["no data"] * (len(headers) - 1)]
         for row in [headers, *rows]:
@@ -94,6 +103,90 @@ def _skill_names(entry: dict) -> str:
     return ", ".join(dict.fromkeys(names)) or "none observed"
 
 
+def _language(root: Path, entry: dict) -> str:
+    """Classify submitted firmware sources, not libraries, prose or host tests."""
+    source = root / "runs" / entry["run_id"] / "source" / "src"
+    if not source.is_dir() or source.is_symlink():
+        return "Not recorded"
+    kinds = {".xc": "XC", ".c": "C", ".cc": "C++", ".cpp": "C++", ".cxx": "C++", ".S": "Assembly"}
+    languages = {kinds[p.suffix] for p in source.rglob("*")
+                 if p.is_file() and not p.is_symlink() and p.suffix in kinds and
+                 p.resolve().is_relative_to(source.resolve())}
+    return " + ".join(sorted(languages)) if languages else "Not recorded"
+
+
+def _skill_usage(root: Path, entry: dict) -> dict:
+    """Recorded exposure, not an assumption that enabled skills were consumed."""
+    if entry.get("condition") not in ("native", "native_xtc"):
+        return {"label": "Disabled", "missing": False, "c_guidance": False}
+    calls = entry.get("skill_calls")
+    loads = sum(isinstance(c, dict) and c.get("status") == "completed" and
+                "skill" in str(c.get("tool", "")).lower() and
+                not str(c.get("tool", "")).lower().endswith("list_skills") for c in calls or [])
+    reads = set()
+    event_loads = set()
+    c_guidance = False
+    events_file = root / "runs" / entry["run_id"] / "events.jsonl"
+    if events_file.is_file():
+        with events_file.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                part = event.get("part") if isinstance(event, dict) else None
+                state = part.get("state") if isinstance(part, dict) else None
+                if not isinstance(state, dict) or state.get("status") != "completed":
+                    continue
+                tool = str(part.get("tool", "")).lower()
+                inputs = state.get("input")
+                inputs = inputs if isinstance(inputs, dict) else {}
+                output = str(state.get("output", ""))
+                consulted = False
+                if tool == "skill":
+                    event_loads.add(part.get("callID") or inputs.get("id") or inputs.get("name") or str(len(event_loads)))
+                    consulted = True
+                elif tool == "read":
+                    path = str(inputs.get("path") or inputs.get("filePath") or "")
+                    if re.search(r"(?:^|/)skills/[^/]+/SKILL\.md$", path) and output and "Permission denied" not in output:
+                        reads.add(path)
+                        consulted = True
+                elif tool in ("shell", "bash"):
+                    command = str(inputs.get("command", ""))
+                    paths = re.findall(r"[^\s\"']*skills/[^/\s\"']+/SKILL\.md", command)
+                    if (paths and re.search(r"\b(?:cat|head|sed)\b", command) and
+                            re.search(r"(?m)^#|^name:", output) and "Permission denied" not in output):
+                        reads.update(paths)
+                        consulted = True
+                if consulted:
+                    plain = re.sub(r"\s+", " ", output.replace("*", "").replace("`", ""))
+                    c_guidance |= "write new code in c using lib_xcore, not xc" in plain.lower()
+    loads = max(loads, len(event_loads))
+    labels = ([f"{loads} skill load{'s' if loads != 1 else ''}"] if loads else [])
+    if reads:
+        labels.append(f"{len(reads)} skill-file read{'s' if len(reads) != 1 else ''}")
+    known = calls is not None or events_file.is_file()
+    return {"label": "; ".join(labels) if labels else "None recorded" if known else "Not recorded",
+            "missing": known and not labels, "c_guidance": c_guidance}
+
+
+def _failure_detail(root: Path, entry: dict) -> str:
+    validation = entry.get("validation", {})
+    if validation.get("status") != "failed":
+        return ""
+    output = root / "runs" / entry["run_id"] / "verification"
+    evidence = (validation.get("observations") or {}).get("metrics", {}).get("evidence", [])
+    for name in evidence:
+        if not isinstance(name, str) or not name.endswith("/simulator.log"):
+            continue
+        path = output / name
+        if path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(output.resolve()):
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "Unhandled exception:" in line:
+                    return shorten(line.strip(), width=160, placeholder="...")
+    return shorten(str(validation.get("reason") or "Independent acceptance failed"), width=160, placeholder="...")
+
+
 def _review_for_task(reviews: list[dict], task_id: str) -> dict | None:
     return next((review for review in reviews if review.get("task_id") == task_id), None)
 
@@ -106,7 +199,11 @@ def _paired(results: list[dict]) -> dict[tuple, dict[str, dict]]:
     return pairs
 
 
-CONDITIONS = {"native": "Skills", "no_skills": "No skills", "no_skills_xtc": "No skills + XTC"}
+CONDITIONS = {"native": "Skills", "native_xtc": "Skills + XTC", "no_skills": "No skills", "no_skills_xtc": "No skills + XTC"}
+
+
+def _skill_conditions(pair: dict) -> tuple[str, str]:
+    return "native_xtc", "no_skills_xtc"
 
 
 def _model(entry: dict) -> str:
@@ -116,6 +213,24 @@ def _model(entry: dict) -> str:
 
 def _label(entry: dict) -> str:
     return f"{_model(entry)} / {CONDITIONS.get(entry.get('condition'), entry.get('condition', 'Unknown'))}"
+
+
+def _task_title(task: str) -> str:
+    known = {"specific": "specific request", "everyday": "everyday request", "vague": "vague request"}
+    if task.startswith("uart-heartbeat-"):
+        suffix = task.removeprefix("uart-heartbeat-")
+        return "UART heartbeat — " + known.get(suffix, suffix.replace("-", " "))
+    return task.replace("-", " ").replace("_", " ").capitalize()
+
+
+def _value_text(value: object) -> str:
+    if value is None:
+        return "not measured"
+    if isinstance(value, dict):
+        return "; ".join(f"{key}: {_value_text(item)}" for key, item in value.items()) or "not recorded"
+    if isinstance(value, list):
+        return "; ".join(_value_text(item) for item in value) or "none recorded"
+    return str(value)
 
 
 def _number(value: object) -> bool:
@@ -142,50 +257,32 @@ def _completed(entry: dict | None) -> bool:
                 entry.get("invocation", {}).get("exit_code") == 0)
 
 
-def _worker_evidence(root: Path, entry: dict) -> str:
-    """Describe recorded tool output, never promote agent-run checks to verification.
-
-    Only completed shell-tool results count, not assistant prose or DESIGN.md.
-    Recognizers are deliberately conservative; unknown formats stay unclassified.
-    """
-    path = root / "runs" / str(entry.get("run_id", "")) / "events.jsonl"
-    built = simulated = waveform = compiler_missing = False
-    if path.is_file():
-        with path.open(encoding="utf-8", errors="replace") as stream:
-            for line in stream:
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(event, dict):
-                    continue
-                part = event.get("part")
-                if not isinstance(part, dict) or part.get("tool") not in ("shell", "bash"):
-                    continue
-                state = part.get("state")
-                if not isinstance(state, dict) or state.get("status") != "completed":
-                    continue
-                output = str(state.get("output", ""))
-                simulated |= bool(re.search(
-                    r"C51188: maximum cycles reached|Expected bounded stop after \d+ cycles|"
-                    r"Simulated \d+ cycles; expected cycle-limit termination", output))
-                compiler_missing |= bool(re.search(
-                    r"(?:xcc: (?:No such file or directory|command not found)|xcc: not found)", output))
-                # A combined build/test command may include xsim's normal bounded stop.
-                build_output = re.sub(r"(?m)^.*C51188: maximum cycles reached.*$", "", output)
-                if not re.search(r"(?im)(?:\berror:|\*\*\*|exceeded timeout)", build_output):
-                    built |= bool(re.search(r"Built target |Constraints checks PASSED\.", output))
-                waveform |= bool(re.search(r"(?im)^PASS:.*(?:UART|frames|square|waveform)", output) or
-                                 (re.search(r"\b\d+ passed\b", output) and
-                                  re.search(r"(?m)^UART:.*\bframes\b", output) and
-                                  re.search(r"(?m)^Square:", output)))
-    if built and simulated and waveform:
-        return "Build + waveform checks logged"
-    if built:
-        return "Build logged; no waveform pass logged"
-    if compiler_missing:
-        return "Compiler not found in worker PATH"
-    return "No build/waveform pass identified"
+def _validate_results(conf: dict, results: list[dict], reviews: list[dict]) -> None:
+    from verification.uart_heartbeat import VERSION, validate_observations
+    tasks = {t["id"]: t for t in conf["tasks"]}
+    if any(t.get("verifier") != VERSION or t.get("evaluation_class") != "implementation" for t in tasks.values()):
+        raise ValueError("Reports require supported independent implementation verification; rerun with the current protocol")
+    fingerprints: dict[str, set[str]] = {}
+    for entry in results:
+        task_id = entry.get("task_id")
+        if task_id not in tasks:
+            raise ValueError("Result references a task without a configured independent verifier")
+        validation = entry.get("validation", {})
+        status = validation.get("status")
+        if status == "error":
+            continue
+        if status not in ("passed", "failed"):
+            raise ValueError("Reports require independent passed/failed results; unverified archives are not supported")
+        observed = validation.get("observations")
+        validate_observations(observed)
+        if observed["passed"] != (status == "passed"):
+            raise ValueError("Independent status contradicts its verification evidence")
+        fingerprints.setdefault(task_id, set()).add(observed["protocol"]["verifier_sha256"])
+    if any(len(values) > 1 for values in fingerprints.values()):
+        raise ValueError("Cannot compare submissions checked by different verifier revisions")
+    for review in reviews:
+        if review.get("status") == "reviewed" and review.get("evaluation_class") != "implementation":
+            raise ValueError("Reports require implementation-only review, not mixed legacy rankings")
 
 
 def _ranking(review: dict | None, entries: dict[str, dict]) -> list[tuple[str, dict, dict]]:
@@ -201,8 +298,20 @@ def _ranking(review: dict | None, entries: dict[str, dict]) -> list[tuple[str, d
 def _review_text(text: str, review: dict, entries: dict[str, dict]) -> str:
     """Resolve anonymous references for readers; preserve original prose in appendix."""
     mapping = review.get("blind_mapping", {})
-    return re.sub(r"\bcandidate_\d+\b", lambda m: _label(entries[mapping[m[0]]])
-                  if mapping.get(m[0]) in entries else "another submission", text)
+    return re.sub(r"\bcandidates?_(\d+)\b", lambda m: _label(entries[mapping["candidate_" + m[1]]])
+                  if mapping.get("candidate_" + m[1]) in entries else "another submission", text)
+
+
+def _ranking_reason(candidate: dict, review: dict, entries: dict[str, dict]) -> str:
+    explicit = candidate.get("ranking_reason")
+    if isinstance(explicit, str) and explicit.strip():
+        return shorten(_review_text(explicit, review, entries), width=300, placeholder="...")
+    summary = str(candidate.get("summary") or "")
+    sentences = re.split(r"(?<=[.!?])\s+", summary)
+    reasons = [s for s in sentences if s.strip() and not re.match(r"^(?:PASSED|FAILED)\b", s)]
+    ranked = next((s for s in reasons if re.search(r"\branked?\b|\bbecause\b|\badvantage\b|\boutweigh", s, re.I)), None)
+    text = ranked or (reasons[0] if reasons else "No separate ranking rationale supplied; see the full review.")
+    return shorten(_review_text(text, review, entries), width=300, placeholder="...")
 
 
 def _change(value: float, baseline: float, positive: str, negative: str) -> str:
@@ -214,42 +323,56 @@ def _change(value: float, baseline: float, positive: str, negative: str) -> str:
     return f"{abs(delta):.0f}% {positive if delta < 0 else negative}"
 
 
-def _comparisons(r: Rst, pairs: dict, ranks: dict[str, int], *, warm: bool = False) -> None:
+def _comparisons(r: Rst, pairs: dict, ranks: dict[str, int], languages: dict, skill_usage: dict, failures: dict) -> None:
     """Compare matched trials, using medians rather than cherry-picking repeats."""
-    condition = "no_skills_xtc" if warm else "native"
     groups: dict[tuple[str, str], list[dict]] = {}
     for (task, model, _), pair in pairs.items():
-        if condition in pair or "no_skills" in pair:
+        if any(c in pair for c in ("native_xtc", "no_skills_xtc")):
             groups.setdefault((task, model), []).append(pair)
     if not groups:
         r.para("No matching conditions were recorded.")
         return
     tasks = {task for task, _ in groups}
     for (task, model), trials in sorted(groups.items()):
-        title = _model({"model_label": model}) + (f" ({task})" if len(tasks) > 1 else "")
-        valid = [p for p in trials if _completed(p.get(condition)) and _completed(p.get("no_skills"))]
+        condition, baseline = _skill_conditions({c: e for pair in trials for c, e in pair.items()})
+        title = _model({"model_label": model}) + (f" ({_task_title(task)})" if len(tasks) > 1 else "")
+        valid = [p for p in trials if _completed(p.get(condition)) and _completed(p.get(baseline))]
         if not valid:
             r.bullets([f"**{cell(title)}:** no completed matched pair; missing or errored runs cannot be compared."])
             continue
-        subject = "preactivated XTC" if warm else "skills"
+        subject = "skills"
         statements = []
+        if len(valid) == 1:
+            enabled, baseline_entry = valid[0][condition], valid[0][baseline]
+            def outcome(e):
+                language = languages[e["run_id"]]
+                return _condition_status(e) + (f" ({language})" if language != "Not recorded" else "")
+            statements.append(f"No skills: {outcome(baseline_entry)}; skills enabled: {outcome(enabled)}.")
+            usage = skill_usage[enabled["run_id"]]
+            if usage["missing"]:
+                statements.append("FLAG: no skill consultation recorded in the enabled run; "
+                                  "this does not demonstrate an effect of reading skill content.")
+            elif usage["label"] != "Not recorded":
+                statements.append(f"Recorded consultation: {usage['label']}.")
+            if failures[enabled["run_id"]]:
+                statements.append(f"Failure: {failures[enabled['run_id']]}.")
         times = [(p[condition].get("invocation", {}).get("elapsed_seconds"),
-                  p["no_skills"].get("invocation", {}).get("elapsed_seconds")) for p in valid]
+                  p[baseline].get("invocation", {}).get("elapsed_seconds")) for p in valid]
         times = [(a, b) for a, b in times if _number(a) and _number(b) and a >= 0 and b >= 0]
         if times:
             a, b = median(a for a, _ in times), median(b for _, b in times)
             scope = f"Median across {len(times)} paired trials: " if len(trials) > 1 else ""
-            statements.append(f"{scope}{subject} took {_duration(a)} versus {_duration(b)} without "
-                              f"{'preactivation' if warm else 'skills'} ({_change(a, b, 'faster', 'slower')}).")
-        costs = [(_credits(p[condition]), _credits(p["no_skills"])) for p in valid]
+            statements.append(f"{scope}Skills-enabled run took {_duration(a)} versus {_duration(b)} without "
+                              f"skills ({_change(a, b, 'faster', 'slower')}).")
+        costs = [(_credits(p[condition]), _credits(p[baseline])) for p in valid]
         costs = [(a, b) for a, b in costs if a is not None and b is not None]
         if costs:
             a, b = median(a for a, _ in costs), median(b for _, b in costs)
             scope = f"Median across {len(costs)} paired trials: " if len(trials) > 1 else ""
-            statements.append(f"{scope}estimated usage was {a:.2f} versus {b:.2f} AI Credits "
+            statements.append(f"{scope}Estimated usage was {a:.2f} versus {b:.2f} AI Credits "
                               f"({_change(a, b, 'lower', 'higher')}).")
-        ranked = [(ranks[p[condition]["run_id"]], ranks[p["no_skills"]["run_id"]])
-                  for p in valid if p[condition].get("run_id") in ranks and p["no_skills"].get("run_id") in ranks]
+        ranked = [(ranks[p[condition]["run_id"]], ranks[p[baseline]["run_id"]])
+                  for p in valid if p[condition].get("run_id") in ranks and p[baseline].get("run_id") in ranks]
         if len(ranked) == 1:
             a, b = ranked[0]
             statements.append(f"Blind design rank: {a} with {subject}, {b} without.")
@@ -257,20 +380,22 @@ def _comparisons(r: Rst, pairs: dict, ranks: dict[str, int], *, warm: bool = Fal
             preferred = sum(a < b for a, b in ranked)
             statements.append(f"Blind review preferred {subject} in {preferred}/{len(ranked)} ranked pairs.")
         verified = [p for p in valid if all(_condition_status(p[c]) in ("passed", "failed")
-                                          for c in (condition, "no_skills"))]
-        if verified:
+                                          for c in (condition, baseline))]
+        if verified and len(valid) > 1:
             statements.append(f"Independent passes in {len(verified)} verified pairs: "
                               f"{sum(_condition_status(p[condition]) == 'passed' for p in verified)} "
-                              f"with {subject}, {sum(_condition_status(p['no_skills']) == 'passed' for p in verified)} without.")
+                              f"with {subject}, {sum(_condition_status(p[baseline]) == 'passed' for p in verified)} without.")
         if len(valid) < len(trials):
             statements.append(f"{len(trials) - len(valid)} incomplete/error pairs excluded.")
-        r.bullets([f"**{cell(title)}:** " + " ".join(statements or ["Timing and usage were not recorded."])])
+        r.subsection(title)
+        r.bullets([cell(s) for s in statements or ["Timing and usage were not recorded."]])
 
 
 def build_report(root: Path, conf: dict, manifest: dict | None, results: list[dict],
                  reviews: list[dict], now_iso: Callable[[], str],
                  model_profile: Callable[[dict, str], dict]) -> Path:
     experiment = conf["experiment"]
+    _validate_results(conf, results, reviews)
     planned = manifest.get("run_order", []) if manifest else []
     started = manifest.get("started_utc", "unrecorded") if manifest else "unrecorded"
     missing = max(len(planned) - len(results), 0)
@@ -278,24 +403,16 @@ def build_report(root: Path, conf: dict, manifest: dict | None, results: list[di
     incomplete = bool(errors or missing)
     passed = sum(_condition_status(e) == "passed" for e in results)
     failed = sum(_condition_status(e) == "failed" for e in results)
-    unverified = sum(_condition_status(e) == "unverified" for e in results)
     pairs = _paired(results)
     complete_pairs = [(key, pair) for key, pair in pairs.items()
-                      if "native" in pair and "no_skills" in pair and
-                      all(_condition_status(e) in ("passed", "failed") for e in pair.values()
-                          if e.get("condition") in ("native", "no_skills"))]
-    native_improved = sum(_condition_status(pair["native"]) == "passed" and
-                          _condition_status(pair["no_skills"]) == "failed"
-                          for _, pair in complete_pairs)
-    native_worsened = sum(_condition_status(pair["native"]) == "failed" and
-                          _condition_status(pair["no_skills"]) == "passed"
-                          for _, pair in complete_pairs)
-    native_unchanged = len(complete_pairs) - native_improved - native_worsened
+                      if all(_condition_status(pair.get(c)) in ("passed", "failed") for c in _skill_conditions(pair))]
     worker_cost = sum((e.get("usage", {}).get("copilot_estimated_usd") or 0) for e in results)
     reviewer_cost = sum((e.get("usage", {}).get("copilot_estimated_usd") or 0) for e in reviews)
     total_cost = worker_cost + reviewer_cost
     entries = {e["run_id"]: e for e in results}
-    evidence = {run_id: _worker_evidence(root, e) for run_id, e in entries.items()}
+    languages = {run_id: _language(root, e) for run_id, e in entries.items()}
+    skill_usage = {run_id: _skill_usage(root, e) for run_id, e in entries.items()}
+    failures = {run_id: _failure_detail(root, e) for run_id, e in entries.items()}
     ranks = {}
     for review in reviews:
         for rank, (_, entry, _) in enumerate(_ranking(review, entries), 1):
@@ -304,7 +421,6 @@ def build_report(root: Path, conf: dict, manifest: dict | None, results: list[di
 
     r = Rst()
     r.title("Gladiators - AI Coding-Agent Benchmark")
-    r.para("*Are you not entertained?*")
     r.para(f"**Experiment:** {cell(experiment.get('name', root.name))} | "
            f"**Started (UTC):** {cell(started)} | **Report:** {now_iso()}")
 
@@ -314,46 +430,50 @@ def build_report(root: Path, conf: dict, manifest: dict | None, results: list[di
         r.para("**INCOMPLETE EXPERIMENT — NO VALID SKILLS-VERSUS-NO-SKILLS CONCLUSION.** "
                "Some candidates failed to run or are missing. Correct the errors and repeat the paired trial.")
     elif not complete_pairs:
-        r.para("**No independently verified paired comparison is available.** "
-               "Correctness remains unproven; time, usage and blind design preferences can still be compared descriptively.")
+        r.para("**No complete matched pass/fail pair is available yet.** "
+               "Only independently checked submissions are reported; execution errors remain incomplete.")
     else:
-        r.para(f"Across {len(complete_pairs)} independently verified native/no-skills pairs, "
-               f"skills improved the pass outcome in {native_improved}, worsened it in "
-               f"{native_worsened}, and made no difference to pass/fail in {native_unchanged}. "
-               "These are descriptive results, not statistical evidence.")
+        r.para(f"**{passed} of {len(results)} submissions passed the same independent acceptance test.** "
+               f"{failed} failed; {len(errors)} had execution errors. "
+               "The paired results below are observations, not evidence that skills caused the differences.")
     r.para(f"**{len(results)} of {len(planned)} scheduled workers recorded.**" if planned else
            f"**{len(results)} worker runs recorded.**")
     task_ids = list(dict.fromkeys(str(e.get("task_id")) for e in results))
+    r.para(f"**Matrix:** {len(conf['tasks'])} task(s), {len(conf['models']['workers'])} models, "
+           f"{len(conf['conditions'])} conditions; {experiment.get('repeats', 1)} repeat(s) per combination.")
     for task in task_ids:
         task_entries = [e for e in results if str(e.get("task_id")) == task]
         review = _review_for_task(reviews, task)
         ranking = _ranking(review, entries)
         findings = []
-        prefix = f"{cell(task)}: " if len(task_ids) > 1 else ""
+        prefix = f"{cell(_task_title(task))}: " if len(task_ids) > 1 else ""
         if ranking and ranking[0][1]:
             findings.append(prefix + f"**Best blind design rank:** {cell(_label(ranking[0][1]))}. "
-                            "This is the reviewer's source-and-test assessment, not a correctness pass.")
-        eligible = [e for e in task_entries if _completed(e) and
-                    (_condition_status(e) == "passed" or evidence[e["run_id"]] == "Build + waveform checks logged") and
-                    _condition_status(e) != "failed"]
+                            "Design preference is separate from the independent correctness result.")
+        eligible = [e for e in task_entries if _completed(e) and _condition_status(e) == "passed"]
         timed = [e for e in eligible if _number(e.get("invocation", {}).get("elapsed_seconds")) and
                  e["invocation"]["elapsed_seconds"] >= 0]
         if timed:
             fastest = min(timed, key=lambda e: e["invocation"]["elapsed_seconds"])
-            findings.append(prefix + f"**Lowest recorded worker time among submissions with build/check evidence:** "
+            findings.append(prefix + f"**Lowest worker time among independently passing submissions:** "
                             f"{cell(_label(fastest))}, {_duration(fastest['invocation']['elapsed_seconds'])}.")
         priced = [e for e in eligible if _credits(e) is not None]
         if priced:
             cheapest = min(priced, key=lambda e: _credits(e))
             findings.append(prefix + f"**Lowest estimated worker usage among those submissions:** "
                             f"{cell(_label(cheapest))}, {_credits(cheapest):.2f} AI Credits.")
-        no_compiler = [e for e in task_entries if evidence[e["run_id"]] == "Compiler not found in worker PATH"]
-        for e in no_compiler:
-            findings.append(prefix + f"**Environment hurdle:** {cell(_label(e))} logged a compiler-not-found "
-                            "failure. Its short runtime is not evidence of a working implementation.")
         if findings:
             r.bullets(findings)
-    r.para(f"**Independent correctness:** {passed} passed; {failed} failed; {unverified} unverified; "
+    flags = [f"**Skill-use flag — {cell(_label(e))}:** skills enabled, but no consultation recorded. "
+             "Do not interpret this as demonstrated use of the skill content."
+             for e in results if skill_usage[e["run_id"]]["missing"]]
+    if flags:
+        r.bullets(flags)
+    failure_notes = [f"**Failed submission — {cell(_label(e))} ({cell(languages[e['run_id']])}):** "
+                     + cell(failures[e["run_id"]]) for e in results if failures[e["run_id"]]]
+    if failure_notes:
+        r.bullets(failure_notes)
+    r.para(f"**Independent correctness:** {passed} passed; {failed} failed; "
            f"{len(errors)} run errors. **Estimated total usage:** ${total_cost:.4f}, including the reviewer. "
            "Worker and reviewer costs are separated in the appendix.")
     if errors:
@@ -361,115 +481,136 @@ def build_report(root: Path, conf: dict, manifest: dict | None, results: list[di
                    for e in errors])
 
     r.section("Results at a glance")
-    r.para("Skills = native XMOS skills, XTC not preactivated. No skills = neither skills nor preactivation. "
-           "No skills + XTC = toolchain preactivated, no skills. Cold workers can discover and activate XTC themselves.")
+    r.para("Skills + XTC and No skills + XTC both start with the toolchain ready; only skill availability differs. "
+           "Every submission is freshly built and checked by the same independent verifier: 1 ms startup, "
+           "then 25 ms of concurrent UART and square-wave observation.")
     for task in task_ids:
-        r.subsection(task)
+        r.subsection(_task_title(task))
         task_entries = [e for e in results if str(e.get("task_id")) == task]
         multiple_trials = len({e.get("repeat") for e in task_entries}) > 1
-        headers = ["Model", "Condition"] + (["Trial"] if multiple_trials else [])
-        headers += ["Worker time", "Est. credits", "Worker log evidence", "Blind rank"]
+        headers = ["Rank", "Model", "Condition"] + (["Trial"] if multiple_trials else [])
+        headers += ["Language", "Worker time", "Est. credits", "Independent check"]
         rows = []
-        order = {"no_skills": 0, "native": 1, "no_skills_xtc": 2}
-        for e in sorted(task_entries, key=lambda e: (str(e.get("model_label")), str(e.get("repeat")),
-                                                    order.get(e.get("condition"), 3))):
-            row = [_model(e), CONDITIONS.get(e.get("condition"), e.get("condition"))]
+        order = {"no_skills": 0, "native": 1, "no_skills_xtc": 2, "native_xtc": 3}
+        for e in sorted(task_entries, key=lambda e: (ranks.get(e["run_id"], float("inf")), str(e.get("model_label")), str(e.get("repeat")),
+                                                     order.get(e.get("condition"), 3))):
+            row = [ranks.get(e["run_id"], "not ranked"), _model(e), CONDITIONS.get(e.get("condition"), e.get("condition"))]
             if multiple_trials:
                 row.append(e.get("repeat"))
-            worker_evidence = {
-                "Build + waveform checks logged": "Build + sim checks",
-                "Build logged; no waveform pass logged": "Build only",
-                "Compiler not found in worker PATH": "No compiler on PATH",
-            }.get(evidence[e["run_id"]], "Not identified") if _completed(e) else "Worker error / incomplete"
-            row += [_duration(e.get("invocation", {}).get("elapsed_seconds")),
+            outcome = _condition_status(e)
+            row += [languages[e["run_id"]], _duration(e.get("invocation", {}).get("elapsed_seconds")),
                     f"{_credits(e):.2f}" if _credits(e) is not None else "not recorded",
-                    worker_evidence, ranks.get(e["run_id"], "not ranked")]
+                    outcome.capitalize()]
             rows.append(row)
-        r.table(headers, rows)
-        statuses = {_condition_status(e) for e in task_entries}
-        if statuses == {"unverified"}:
-            r.para("**All submissions above are independently UNVERIFIED.** Logged checks were run by the "
-                   "worker, not a trusted verifier.")
-        else:
-            r.bullets([f"Independent check for {cell(_label(e))}, trial {cell(e.get('repeat'))}: "
-                       f"**{cell(_condition_status(e))}**." for e in task_entries])
-    r.para("Times are worker wall time throughout, not time to verified success. Log evidence describes "
-           "recognizable completed shell-tool output, not a new verification or a reading of worker claims. "
-           "Unrecognized or missing logs are not proof that a build failed. Credits are usage estimates, not invoices.")
+        r.table(headers, rows, [6, 9, 20] + ([6] if multiple_trials else []) + [8, 14, 12, 19])
+    r.para("Times are worker wall time throughout. Verifier duration and worker-plus-verifier finish time "
+           "are recorded separately. Candidate-authored tests and claims do not determine pass/fail. "
+           "Credits are usage estimates, not invoices.")
+
+    r.section("Language choices and skill consultation")
+    for task in task_ids:
+        if len(task_ids) > 1:
+            r.subsection(_task_title(task))
+        task_entries = [e for e in results if str(e.get("task_id")) == task]
+        categories = ["XC", "C"] + sorted({languages[e["run_id"]] for e in task_entries} - {"XC", "C"})
+        rows = []
+        conditions = sorted({e.get("condition") for e in task_entries},
+                            key=lambda c: (c != "no_skills_xtc", str(c)))
+        for condition in conditions:
+            group = [e for e in task_entries if e.get("condition") == condition]
+            counts = [sum(languages[e["run_id"]] == language for e in group) for language in categories]
+            def percentage(count):
+                value = f"{100 * count / len(group):.1f}".removesuffix(".0")
+                return f"{value}% ({count}/{len(group)})"
+            rows.append([CONDITIONS.get(condition, condition)] + [percentage(n) for n in counts])
+        r.table(["Condition", *categories], rows, [40] + [60 // len(categories)] * len(categories))
+        r.para("Percentages count submissions within each condition, including failed submissions, not lines of code. "
+               "Mixed-language and missing-source submissions are separate categories when present. "
+               "Host tests and preinstalled libraries are excluded. There is no combined overall percentage.")
+        enabled = [e for e in task_entries if e.get("condition") in ("native", "native_xtc")]
+        multiple_trials = len({e.get("repeat") for e in enabled}) > 1
+        r.table(["Skills-enabled model"] + (["Trial"] if multiple_trials else []) + ["Recorded consultation"], [
+            [_model(e)] + ([e.get("repeat")] if multiple_trials else []) +
+            [skill_usage[e["run_id"]]["label"] + (" — FLAG" if skill_usage[e["run_id"]]["missing"] else "")]
+            for e in sorted(enabled, key=lambda e: (str(e.get("model_label")), str(e.get("repeat"))))],
+            [30] + ([10] if multiple_trials else []) + [70])
+    r.para("Consultation is based on successful recorded skill loads and explicit skill-file reads. "
+           "Enabled does not mean consulted; missing telemetry is shown as not recorded rather than assumed to be zero.")
+    shifts = []
+    for (task, model, trial), pair in sorted(pairs.items()):
+        condition, baseline = _skill_conditions(pair)
+        enabled, no = pair.get(condition), pair.get(baseline)
+        if not _completed(enabled) or not _completed(no):
+            continue
+        before, after = languages[no["run_id"]], languages[enabled["run_id"]]
+        if before != after and "Not recorded" not in (before, after):
+            title = _model(enabled) + (f" ({_task_title(task)})" if len(task_ids) > 1 else "")
+            shifts.append(f"**{cell(title)}, trial {cell(trial)}:** {cell(before)} to {cell(after)}; "
+                          f"independent outcome {_condition_status(no)} to {_condition_status(enabled)}.")
+    if shifts:
+        r.para("**Paired language shifts and correctness outcomes**")
+        r.bullets(shifts)
+    if any(value["c_guidance"] for value in skill_usage.values()):
+        r.para('Recorded consulted skill content explicitly says: "Write new code in C using lib_xcore, not XC". '
+               "This establishes prescriptive C guidance, not that C or the skills caused a particular failure.")
+    r.para("Language choice, skill availability, actual consultation and correctness must be considered together. "
+           "Repeated paired trials are needed to determine whether C-directed guidance systematically changes outcomes.")
 
     r.section("Did skills help?")
+    r.para("XTC was preactivated for both conditions. Skills means availability; actual consultation is reported separately.")
     if incomplete:
         r.para("**Comparison invalid for the full experiment:** some runs are missing or errored. "
                "Only completed matched pairs are described below.")
-    _comparisons(r, pairs, ranks)
-    r.para("These are effort and design comparisons, not proof that skills improved correctness. "
-           "A faster worker can simply have stopped before compiling; read the execution evidence alongside its time.")
-
-    if "no_skills_xtc" in conf["conditions"]:
-        r.section("Did preactivating XTC help?")
-        _comparisons(r, pairs, ranks, warm=True)
-        r.para("This compares no-skills workers with and without a prepared toolchain. "
-               "It separates the environment hurdle from skill guidance, but does not by itself establish correctness.")
-        warm_pairs = [p for p in pairs.values() if _completed(p.get("native")) and _completed(p.get("no_skills_xtc"))]
-        if warm_pairs:
-            r.para("**Skills versus a prepared environment:**")
-            for task, model in sorted({(str(p["native"].get("task_id")), str(p["native"].get("model_label")))
-                                       for p in warm_pairs}):
-                matched = [p for p in warm_pairs if str(p["native"].get("model_label")) == model and
-                           str(p["native"].get("task_id")) == task]
-                timed = [p for p in matched if all(_number(p[c].get("invocation", {}).get("elapsed_seconds"))
-                                                 and p[c]["invocation"]["elapsed_seconds"] >= 0
-                                                 for c in ("native", "no_skills_xtc"))]
-                if timed:
-                    a = median(p["no_skills_xtc"]["invocation"]["elapsed_seconds"] for p in timed)
-                    b = median(p["native"]["invocation"]["elapsed_seconds"] for p in timed)
-                    label = _model({"model_label": model}) + (f" ({task})" if len(task_ids) > 1 else "")
-                    scope = f"; paired medians across {len(timed)} trials" if len(timed) > 1 else ""
-                    r.bullets([f"**{cell(label)}:** no skills + XTC took "
-                               f"{_duration(a)} versus {_duration(b)} with skills "
-                               f"({_change(a, b, 'faster', 'slower')}{scope})."])
-            r.para("This is not an isolated skills effect: both skills and initial toolchain state change. "
-                   "A skills + preactivated XTC condition is needed to separate them.")
+    _comparisons(r, pairs, ranks, languages, skill_usage, failures)
+    r.para("Compare independent pass outcomes before time or cost: a failed submission is not an efficient solution. "
+           "A single matched pair does not establish a reliable causal skills effect.")
 
     r.section("Blind design ranking")
-    r.para("The reviewer assessed anonymised source and supplied tests without knowing the models or "
+    r.para("The reviewer assessed anonymised implementation source and independent verifier results without knowing the models or "
            "conditions. Lower rank is better; it is not an independent correctness score.")
     if not reviews:
         r.para("No blind review was run.")
     for review in reviews:
-        r.subsection(str(review.get("task_id")))
+        r.subsection(_task_title(str(review.get("task_id"))))
+        r.para("**Scope: xcore implementation only.** Candidate test-framework authoring is not scored.")
         ranking = _ranking(review, entries)
         if not ranking:
             r.para(f"Ranking unavailable ({cell(review.get('status', 'unknown'))}).")
             continue
         multiple_trials = len({e.get("repeat") for _, e, _ in ranking if e}) > 1
-        headers = ["Rank", "Model", "Condition"] + (["Trial"] if multiple_trials else []) + ["Reviewer's takeaway"]
+        headers = ["Rank", "Model", "Condition"] + (["Trial"] if multiple_trials else []) + ["Reason for rank"]
         rows = []
         for rank, (_, e, candidate) in enumerate(ranking, 1):
-            summary = _review_text(str(candidate.get("summary") or "No assessment supplied."), review, entries)
-            summary = re.sub(r"^(?:First|Second|Third|Fourth|Fifth|Sixth|Last):\s*", "", summary)
-            takeaway = shorten(re.split(r"(?<=[.!?])\s+", summary)[0], width=230, placeholder="...")
+            takeaway = _ranking_reason(candidate, review, entries)
             row = [rank, _model(e), CONDITIONS.get(e.get("condition"), e.get("condition", "Unknown submission"))]
             if multiple_trials:
                 row.append(e.get("repeat"))
             rows.append(row + [takeaway])
-        r.table(headers, rows)
+        r.table(headers, rows, [6, 11, 22] + ([6] if multiple_trials else []) + [61])
     r.para("Full reviewer reasoning, risks, scores and anonymous-to-run mappings are in the appendix.")
 
     r.section("What we can and cannot conclude")
     r.bullets([
-        "Worker logs show what the agent attempted and recorded. Only an independent verifier can establish a correctness pass; "
-        "a model review or successful-looking tool output cannot substitute for it.",
-        "Time/cost savings and design preferences are different outcomes. More decoded frames or more tests alone do not establish a better design.",
+        "Correctness comes from the mandatory uniform verifier. All passing submissions meet the same observation window and acceptance criteria.",
+        "Time/cost savings and blind implementation-design preferences are different outcomes; report them separately.",
         "Single trials are exploratory. Repeated matched trials and the same independent verifier are needed before attributing differences to skills.",
-        "Without a skills + preactivated XTC condition, skills cannot be isolated from environment setup in the warm-versus-skills comparison.",
+        "Both conditions use preactivated XTC, so initial toolchain state is controlled. Test-framework authoring is not scored.",
         "Estimated credits may use incomplete event telemetry and do not establish actual billed charges. "
         "Model identity, global settings and host isolation warnings are retained in the appendix.",
     ])
-    r.para("**Next experiment:** add a skills + preactivated XTC condition, use identical independent build/waveform "
-           "checks for every condition, and repeat each matched trial at least three times.")
+    r.para("**Next step:** repeat each matched implementation trial at least three times. "
+           "Evaluate simulation-test-framework skills separately using known-good and faulty applications.")
 
     r.section("Appendix - detailed evidence and reproducibility")
+
+    ordered_entries = sorted(results, key=lambda e: (str(e.get("task_id")), ranks.get(e["run_id"], float("inf")),
+                                                     str(e.get("model_label")), str(e.get("repeat")), str(e.get("condition"))))
+    refs = {e["run_id"]: f"R{i:02d}" for i, e in enumerate(ordered_entries, 1)}
+    r.subsection("Submission identifier key")
+    r.para("Short references below keep tables readable. Full identifiers are retained here for log lookup.")
+    for e in ordered_entries:
+        r.bullets([f"**{refs[e['run_id']]} — {cell(_label(e))}, trial {cell(e.get('repeat'))}:** "
+                   + literal(e["run_id"])])
 
     r.subsection("Method at a glance")
     conditions = ", ".join(conf["conditions"].keys())
@@ -477,8 +618,8 @@ def build_report(root: Path, conf: dict, manifest: dict | None, results: list[di
            "Models were accessed **through GitHub Copilot**; worker variants were "
            f"{cell(conditions)}. A separate model reviewed anonymised implementations "
             "after the worker runs and any configured independent verification. "
-           "The preactivated-XTC control (when selected) has no skills; only its "
-           "toolchain environment differs from the no-skills baseline. "
+            "Preactivation makes tools available so workers can attempt the implementation; "
+            "it is not an implementation-quality score. "
            "Time, token use, skills invoked and estimated Copilot costs were recorded. "
            "Single trials should not be treated as statistically significant.")
     role_rows = []
@@ -499,7 +640,7 @@ def build_report(root: Path, conf: dict, manifest: dict | None, results: list[di
     r.para(f"Estimated worker usage: ${worker_cost:.6f}; reviewer usage: ${reviewer_cost:.6f}; "
            f"total: ${total_cost:.6f}. These are estimates, not billed charges.")
     r.table(["Run", "Independent check", "Worker seconds", "Verified finish seconds", "Est. USD"], [
-        [e.get("run_id"), _condition_status(e), e.get("invocation", {}).get("elapsed_seconds"),
+        [refs[e["run_id"]], _condition_status(e), e.get("invocation", {}).get("elapsed_seconds"),
          e.get("time_to_verified_success_s"), e.get("usage", {}).get("copilot_estimated_usd")]
         for e in results])
     r.bullets([f"{literal(e.get('run_id'))}: {cell(e.get('error') or e.get('validation', {}).get('reason') or 'Worker failed or served model did not match.')}"
@@ -507,14 +648,14 @@ def build_report(root: Path, conf: dict, manifest: dict | None, results: list[di
     r.subsection("Task selection")
     r.table(["Task", "Detail level", "Reason chosen", "Verifier"], [
         [t.get("id"), t.get("specificity"), t.get("rationale"),
-         "configured" if t.get("verify_commands") else "not configured"]
+         "configured" if t.get("verifier_configured") or t.get("verifier") or t.get("verify_commands") else "not configured"]
         for t in conf["tasks"]])
 
     r.subsection("Per-run tokens and skill retrieval")
     token_rows = []
     for e in results:
         tokens = e.get("usage", {}).get("tokens") or {}
-        token_rows.append([e.get("run_id"), _skill_names(e),
+        token_rows.append([refs[e["run_id"]], _skill_names(e),
                            tokens.get("input"), tokens.get("cache_read"),
                            tokens.get("cache_write"), tokens.get("output"),
                            tokens.get("reasoning"),
@@ -535,23 +676,28 @@ def build_report(root: Path, conf: dict, manifest: dict | None, results: list[di
                f"why selected: {cell(profile.get('selection_rationale'))}. "
                f"Source: {literal(profile.get('source', 'unrecorded'))}.")
     r.table(["Run", "Requested model", "Observed model(s)", "Token data source", "Warnings"], [
-        [e.get("run_id"), e.get("model"),
+        [refs[e["run_id"]], e.get("model"),
          ", ".join(e.get("observed_models") or []) or "not verified",
          e.get("usage", {}).get("usage_source"), "; ".join(e.get("warnings") or []) or "none"]
         for e in results])
 
     r.subsection("Independent verifier observations")
-    for e in results:
+    for e in ordered_entries:
         v = e.get("validation", {})
         obs = v.get("observations") if isinstance(v, dict) else None
         metrics = obs.get("metrics", {}) if isinstance(obs, dict) else {}
-        r.para(f"**{literal(e.get('run_id', '?'))}**: {cell(v.get('status'))}. "
-               f"Threads/tile: {literal(as_json(metrics.get('threads_per_tile')))}; "
-               f"libraries: {literal(as_json(metrics.get('libraries')))}; "
-               f"RAM/tile: {literal(as_json(metrics.get('ram_bytes_per_tile')))}; "
-               f"evidence: {literal(as_json(metrics.get('evidence')))}.")
+        r.detail(f"{refs[e['run_id']]} — {_label(e)}")
+        r.para(f"**Independent status:** {cell(v.get('status'))}.")
+        if v.get("reason"):
+            r.para(cell(v["reason"]))
+        if metrics:
+            r.table(["Measurement", "Recorded value"], [
+                [str(key).replace("_", " ").capitalize(), _value_text(value)]
+                for key, value in metrics.items()], [30, 70])
+        else:
+            r.para("No independent resource or waveform measurements were recorded.")
         if e.get("design_excerpt_self_reported"):
-            r.para("Worker's own description (unverified):")
+            r.para("Worker's own design notes (not independent measurements):")
             r.code(e["design_excerpt_self_reported"])
 
     r.subsection("Blind review detail")
@@ -559,21 +705,27 @@ def build_report(root: Path, conf: dict, manifest: dict | None, results: list[di
         data = review.get("review")
         if not isinstance(data, dict):
             continue
-        r.para(f"**{cell(review.get('task_id'))} - full reviewer notes:**")
+        r.para(f"**{cell(_task_title(str(review.get('task_id'))))} — full reviewer notes:**")
         r.para(cell(data.get("review_notes", "No summary supplied.")))
         mapping = review.get("blind_mapping", {})
-        for candidate in data.get("candidates", []):
+        task_ranks = {alias: rank for rank, (alias, _, _) in enumerate(_ranking(review, entries), 1)}
+        for candidate in sorted(data.get("candidates", []), key=lambda c: task_ranks.get(c.get("id"), float("inf")) if isinstance(c, dict) else float("inf")):
             if not isinstance(candidate, dict):
                 continue
             alias = candidate.get("id", "unknown")
-            r.para(f"**{cell(review.get('task_id'))} - {cell(alias)} -> "
-                   f"{literal(mapping.get(alias, 'unknown'))}**")
-            r.bullets([
-                "Summary: " + cell(candidate.get("summary", "not assessed")),
-                "Ratings: " + literal(as_json(candidate.get("ratings", {}))),
-                "Major decisions: " + cell(", ".join(candidate.get("major_decisions") or [])),
-                "Risks: " + cell(", ".join(candidate.get("risks") or [])),
-            ])
+            entry = entries.get(mapping.get(alias), {})
+            rank = task_ranks.get(alias, "unranked")
+            r.detail(f"Rank {rank} — {_label(entry)}")
+            r.para(f"Submission: {cell(refs.get(mapping.get(alias), 'unknown'))}; "
+                   f"blind label: {literal(alias)}; trial: {cell(entry.get('repeat'))}.")
+            r.para(cell(_review_text(str(candidate.get("summary", "not assessed")), review, entries)))
+            ratings = candidate.get("ratings")
+            if isinstance(ratings, dict) and ratings:
+                r.table(["Criterion", "Rating (0-5)"], [
+                    [str(key).replace("_", " ").capitalize(), value] for key, value in ratings.items()], [82, 18])
+            for heading, key in (("Major decisions", "major_decisions"), ("Risks", "risks")):
+                r.para(f"**{heading}**")
+                r.bullets([cell(_review_text(str(item), review, entries)) for item in candidate.get(key) or []])
 
     r.subsection("Repeatability and verified finish times")
     repeats: dict[tuple, list[dict]] = {}
@@ -586,7 +738,7 @@ def build_report(root: Path, conf: dict, manifest: dict | None, results: list[di
                  isinstance(e.get("time_to_verified_success_s"), (int, float))]
     finishers.sort(key=lambda e: e["time_to_verified_success_s"])
     r.para("**Travelator - independently verified finish times** (worker plus verifier):")
-    r.table(["Run", "Time (s)"], [[e.get("run_id"), e.get("time_to_verified_success_s")]
+    r.table(["Run", "Time (s)"], [[refs[e["run_id"]], e.get("time_to_verified_success_s")]
                                   for e in finishers])
 
     r.subsection("Provenance, limitations and next steps")
